@@ -34,11 +34,18 @@ Function focus (click any call in any node):
     made from its body become the nodes of column 1, the calls made from
     those become column 2, and so on.
 
+Node display styles (toggle with C, works in either view above):
+    Call list (default) : each node lists the calls its function makes.
+    Source code         : each node shows the function's full source; the
+                          calls it makes are highlighted inline and are
+                          themselves clickable (same re-root behaviour).
+
 Controls
 --------
     Left click a node/call : focus that function (re-root the graph)
     Left drag              : pan
     Mouse wheel            : zoom to cursor
+    C                      : toggle call-list / source-code nodes
     Right click / Backspace: back
     Home                   : return to module overview
     F                      : fit everything on screen
@@ -65,9 +72,16 @@ except Exception:  # pragma: no cover - depends on local install
 class Call:
     """A single call site found inside a function body or module-level code."""
 
-    def __init__(self, raw_name, lineno, callee=None):
+    def __init__(self, raw_name, span, callee=None):
+        # span = (lineno, col_offset, end_lineno, end_col_offset) of the callee
+        # expression (the "func" part of the ast.Call, e.g. "helpers.render").
+        # Used both for the call list and to highlight/click the call in the
+        # source-code view.
         self.raw_name = raw_name      # textual name at the call site, e.g. "helpers.render"
-        self.lineno = lineno
+        self.lineno = span[0]
+        self.col_offset = span[1]
+        self.end_lineno = span[2]
+        self.end_col_offset = span[3]
         self.callee = callee          # resolved Function, or None if unresolved
         self.resolved = callee is not None
 
@@ -87,8 +101,14 @@ class Function:
         self.col = None
         self.x = 0.0
         self.y = 0.0
+        self.w = NODE_W
         self.h = 0.0
         self.visible = False
+        # code-view geometry (set by layout_node when code view is active)
+        self.code_base = None      # absolute lineno of first shown source row
+        self.code_rows = None      # list[(abs_lineno, raw_text)]
+        self.code_overflow = 0     # hidden trailing lines
+        self.code_nlines = 0       # number of shown source rows
 
     def __repr__(self):
         return "<Function %s.%s>" % (self.module.name, self.qualname)
@@ -103,6 +123,7 @@ class Module:
         self.external = external
         self.functions = {}   # qualname -> Function
         self.module_node = None   # synthetic Function for top-level code
+        self.source_lines = None  # list[str], the file's source (for the code view)
         self._scan = None         # ModuleScan (imports + raw calls), for resolution
         self._resolved = False
 
@@ -193,7 +214,15 @@ class ModuleScan(ast.NodeVisitor):
     def visit_Call(self, node):
         raw = self._call_name(node.func)
         if raw is not None:
-            self.calls[self._scope()].append((raw, getattr(node, "lineno", 0)))
+            fn = node.func
+            ln = getattr(fn, "lineno", getattr(node, "lineno", 0))
+            span = (
+                ln,
+                getattr(fn, "col_offset", 0),
+                getattr(fn, "end_lineno", ln),
+                getattr(fn, "end_col_offset", 0),
+            )
+            self.calls[self._scope()].append((raw, span))
         for child in ast.iter_child_nodes(node):
             self.visit(child)
 
@@ -246,6 +275,7 @@ class Project:
             module.external = True
             return module
 
+        module.source_lines = src.splitlines()
         scan = ModuleScan()
         scan.visit(tree)
         module._scan = scan
@@ -282,9 +312,9 @@ class Project:
                 caller = module.functions.get(scope)
             if caller is None:
                 continue
-            for raw, lineno in raw_calls:
+            for raw, span in raw_calls:
                 callee = self._resolve_name(module, scan, scope, raw)
-                caller.calls.append(Call(raw, lineno, callee))
+                caller.calls.append(Call(raw, span, callee))
 
     def _resolve_name(self, module, scan, scope, raw):
         """Best-effort resolution of a raw call name to a Function."""
@@ -391,6 +421,7 @@ PAD_TOP = 6.0
 PAD_BOT = 8.0
 V_GAP = 26.0
 COL_STRIDE = NODE_W + 150.0
+H_GAP = 150.0          # horizontal gap between columns (list mode == old COL_STRIDE)
 NODE_X0 = 40.0
 FRAME_PAD = 18.0
 FRAME_HEADER = 28.0
@@ -400,6 +431,18 @@ MAX_ROWS = 16
 TITLE_FS = 16
 ROW_FS = 13
 FRAME_FS = 18
+
+# --- source-code view metrics --------------------------------------------- #
+CODE_FS = 13
+CODE_LINE_H = 16.0
+CODE_PAD_X = 10.0
+CODE_PAD_TOP = 8.0
+CODE_PAD_BOT = 10.0
+CODE_GUTTER_GAP = 10.0     # gap between line-number gutter and the code text
+CODE_TEXT_PAD = 16.0       # slack added to the right of the widest line
+CODE_NODE_MIN_W = 280.0
+CODE_NODE_MAX_W = 640.0
+MAX_CODE_LINES = 46        # cap a node's shown source lines (rest -> "+N more")
 
 MODULE_PALETTE = [
     (74, 144, 226),    # blue  - main module
@@ -428,23 +471,188 @@ def node_height(f):
     return HEADER_H + PAD_TOP + body + PAD_BOT
 
 
-def bfs_columns(sources, col=None):
-    """Assign a column (shortest call-distance) to each reachable function."""
-    if col is None:
-        col = {}
-    dq = deque()
-    for s in sources:
-        if s not in col:
-            col[s] = 0
-            dq.append(s)
-    while dq:
-        f = dq.popleft()
-        c = col[f]
+# --- code-view helpers ---------------------------------------------------- #
+def _clampf(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def _text_w(s, size):
+    """Pixel width of a string in the default font (estimate when head-less)."""
+    if pr is not None:
+        return float(pr.measure_text(s, size))
+    return float(len(s)) * size * 0.55
+
+
+def function_span(f):
+    """1-based inclusive (start, end) source line range for a Function, or None.
+
+    Decorators are included so the shown snippet matches the file.
+    """
+    node = f.node
+    if node is None or f.module.source_lines is None:
+        return None
+    start = node.lineno
+    for d in getattr(node, "decorator_list", []):
+        start = min(start, getattr(d, "lineno", start))
+    end = getattr(node, "end_lineno", node.lineno)
+    return (start, end)
+
+
+def code_lines_for(f, max_lines=MAX_CODE_LINES):
+    """Return (base_lineno, [(abs_lineno, raw_text), ...], overflow_count).
+
+    For a function, that's its def..end span; for the synthetic module node it
+    is the whole file (capped). base_lineno is the absolute line of the first
+    shown row, so a call's screen row is (call.lineno - base_lineno).
+    """
+    src = f.module.source_lines
+    if src is None:
+        return (1, [], 0)
+    if f.kind == "module":
+        start, end = 1, len(src)
+    else:
+        span = function_span(f)
+        if span is None:
+            return (1, [], 0)
+        start, end = span
+    rows = []
+    for ln in range(start, end + 1):
+        if 1 <= ln <= len(src):
+            rows.append((ln, src[ln - 1]))
+    overflow = 0
+    if len(rows) > max_lines:
+        overflow = len(rows) - max_lines
+        rows = rows[:max_lines]
+    return (start, rows, overflow)
+
+
+def layout_node(f, code_view):
+    """Compute (width, height) for a node in the active display mode.
+
+    In code view this also stashes the resolved source rows on the function so
+    drawing/edge-anchoring/hit-testing all agree on the geometry.
+    """
+    if not code_view:
+        f.code_base = None
+        f.code_rows = None
+        f.code_overflow = 0
+        f.code_nlines = 0
+        return NODE_W, node_height(f)
+
+    base, rows, overflow = code_lines_for(f)
+    f.code_base = base
+    f.code_rows = rows
+    f.code_overflow = overflow
+    f.code_nlines = len(rows)
+
+    max_line_w = 0.0
+    for _, text in rows:
+        w = _text_w(text.expandtabs(4), CODE_FS)
+        if w > max_line_w:
+            max_line_w = w
+    last_no = rows[-1][0] if rows else base
+    gutter_w = _text_w(str(last_no), CODE_FS)
+
+    inner = CODE_PAD_X * 2 + gutter_w + CODE_GUTTER_GAP + max_line_w + CODE_TEXT_PAD
+    w = _clampf(inner, CODE_NODE_MIN_W, CODE_NODE_MAX_W)
+
+    nshown = len(rows) + (1 if overflow else 0)
+    if nshown == 0:
+        nshown = 1
+    h = HEADER_H + CODE_PAD_TOP + nshown * CODE_LINE_H + CODE_PAD_BOT
+    return w, h
+
+
+def _reach_and_adj(sources):
+    """Forward-reachable set plus deduped callee adjacency, from the sources."""
+    reach = set()
+    adj = {}
+    stack = list(sources)
+    while stack:
+        f = stack.pop()
+        if f in reach:
+            continue
+        reach.add(f)
+        outs, seen = [], set()
         for call in f.calls:
             g = call.callee
-            if g is not None and g not in col:
-                col[g] = c + 1
-                dq.append(g)
+            if g is not None and g is not f and g not in seen:
+                seen.add(g)
+                outs.append(g)
+                if g not in reach:
+                    stack.append(g)
+        adj[f] = outs
+    for f in reach:          # leaves
+        adj.setdefault(f, [])
+    return reach, adj
+
+
+def _back_edges(sources, reach, adj):
+    """Edges that close a cycle (point at a node still open on the DFS stack).
+
+    These are the only edges that cannot be drawn strictly left-to-right, so we
+    exclude them from column assignment; every remaining edge then goes forward.
+    """
+    WHITE, GREY, BLACK = 0, 1, 2
+    color = {f: WHITE for f in reach}
+    back = set()
+    for s in sources:
+        if color[s] != WHITE:
+            continue
+        color[s] = GREY
+        st = [(s, iter(adj[s]))]
+        while st:
+            u, it = st[-1]
+            pushed = False
+            for v in it:
+                if color[v] == GREY:          # v is an ancestor -> cycle
+                    back.add((u, v))
+                elif color[v] == WHITE:
+                    color[v] = GREY
+                    st.append((v, iter(adj[v])))
+                    pushed = True
+                    break
+                # BLACK -> forward/cross edge, keep it
+            if not pushed:
+                color[u] = BLACK
+                st.pop()
+    return back
+
+
+def assign_columns(sources):
+    """Longest-path layering.
+
+    Each node is placed one column past its *deepest* caller, so for every call
+    edge caller->callee we get col(callee) > col(caller): no edge ever points
+    into its own column or an earlier one. The sole exception is recursion --
+    genuine cycles cannot be drawn strictly forward, so those back edges are
+    detected and left out of the layering (they still get drawn, just backward).
+    """
+    reach, adj = _reach_and_adj(sources)
+    back = _back_edges(sources, reach, adj)
+
+    dag = {f: [v for v in adj[f] if (f, v) not in back] for f in reach}
+    indeg = {f: 0 for f in reach}
+    for f in reach:
+        for v in dag[f]:
+            indeg[v] += 1
+
+    col = {}
+    dq = deque()
+    for f in reach:
+        if indeg[f] == 0:                 # sources + any cycle-freed roots
+            col[f] = 0
+            dq.append(f)
+    while dq:                             # Kahn topo order == longest path
+        u = dq.popleft()
+        for v in dag[u]:
+            if col[u] + 1 > col.get(v, -1):
+                col[v] = col[u] + 1
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                dq.append(v)
+    for f in reach:                       # safety net (should not fire)
+        col.setdefault(f, 0)
     return col
 
 
@@ -455,32 +663,48 @@ class Layout:
         self.project = project
         self.visible = []          # list[Function]
         self.frames = []           # list[(Module, x, y, w, h)]
+        self.code_view = False
+        self.colx = {}             # column index -> world x of that column
+        self.colw = {}             # column index -> width of that column
 
-    def build(self, sources, include_all_main=False):
+    def build(self, sources, include_all_main=False, code_view=False):
+        self.code_view = code_view
         # reset transient state
         for m in self.project.modules.values():
             for f in m.functions.values():
                 f.col = None
                 f.visible = False
 
-        col = bfs_columns(sources)
+        col = assign_columns(sources)
 
         if include_all_main:
             # Guarantee every main-module function shows in the overview even
             # if it lives inside a cycle unreachable from the chosen sources.
-            for f in self.project.main.functions.values():
-                if f.kind == "module":
-                    continue
-                if f not in col:
-                    bfs_columns([f], col)
+            # Add the missing ones as extra roots and re-layer over the union so
+            # the strictly-forward-edge invariant still holds globally.
+            extra = [f for f in self.project.main.functions.values()
+                     if f.kind != "module" and f not in col]
+            if extra:
+                col = assign_columns(list(sources) + extra)
 
-        # commit column assignment + node heights
+        # commit column assignment + node sizes (mode-dependent)
         self.visible = []
         for f, c in col.items():
             f.col = c
             f.visible = True
-            f.h = node_height(f)
+            f.w, f.h = layout_node(f, code_view)
             self.visible.append(f)
+
+        # per-column widths, then left-to-right column x positions (globally
+        # shared so columns line up across module lanes)
+        self.colw = {}
+        for f in self.visible:
+            self.colw[f.col] = max(self.colw.get(f.col, 0.0), f.w)
+        self.colx = {}
+        cx = NODE_X0
+        for c in sorted(self.colw):
+            self.colx[c] = cx
+            cx += self.colw[c] + H_GAP
 
         self._place_lanes()
 
@@ -514,11 +738,11 @@ class Layout:
             for c in sorted(per_col):
                 y = inner_top
                 for f in sorted(per_col[c], key=lambda fn: (fn.kind != "module", fn.qualname)):
-                    f.x = NODE_X0 + c * COL_STRIDE
+                    f.x = self.colx[c]
                     f.y = y
                     y += f.h + V_GAP
                     min_x = min(min_x, f.x)
-                    max_x = max(max_x, f.x + NODE_W)
+                    max_x = max(max_x, f.x + f.w)
                 lane_bottom = max(lane_bottom, y)
 
             fx = min_x - FRAME_PAD
@@ -533,7 +757,7 @@ class Layout:
             return (0.0, 0.0, 100.0, 100.0)
         minx = min(f.x for f in self.visible)
         miny = min(f.y for f in self.visible)
-        maxx = max(f.x + NODE_W for f in self.visible)
+        maxx = max(f.x + f.w for f in self.visible)
         maxy = max(f.y + f.h for f in self.visible)
         return (minx, miny, maxx - minx, maxy - miny)
 
@@ -599,9 +823,15 @@ class Viewer:
         self.project = project
         self.layout = Layout(project)
         self.mode = "module"       # "module" or "function"
+        self.code_view = False     # False = call-list nodes, True = source-code nodes
         self.root = None           # focused Function in function mode
         self.highlight = None      # callee highlighted after a click
         self.history = []          # stack of (mode, root, highlight)
+
+        # code-view interaction
+        self.mouse_world = (0.0, 0.0)
+        self.code_hits = []        # list of (x, y, w, h, caller_func, call) in world space
+        self._hover_call = None    # call token under the cursor (code view)
 
         # camera + animation
         self.cam = None
@@ -635,7 +865,21 @@ class Viewer:
         self.root = None
         self.highlight = None
         sources = [self.project.main.module_node] + self.project.entrypoints()
-        self.layout.build(sources, include_all_main=True)
+        self.layout.build(sources, include_all_main=True, code_view=self.code_view)
+        self.fit_all()
+
+    def _rebuild_current(self):
+        """Re-run the layout for whatever graph is showing (e.g. after a
+        display-mode toggle), preserving root/highlight."""
+        if self.mode == "module":
+            sources = [self.project.main.module_node] + self.project.entrypoints()
+            self.layout.build(sources, include_all_main=True, code_view=self.code_view)
+        else:
+            self.layout.build([self.root], code_view=self.code_view)
+
+    def toggle_code_view(self):
+        self.code_view = not self.code_view
+        self._rebuild_current()
         self.fit_all()
 
     def focus(self, func, highlight=None, record=True):
@@ -646,7 +890,7 @@ class Viewer:
         self.mode = "function"
         self.root = func
         self.highlight = highlight
-        self.layout.build([func])
+        self.layout.build([func], code_view=self.code_view)
         # place the focused node near the top-left of the screen
         self.goal_target = (func.x - 12.0, func.y - 12.0)
         self.goal_zoom = 1.0
@@ -691,8 +935,19 @@ class Viewer:
     # ---- hit testing ----------------------------------------------------- #
     def _func_at(self, wx, wy):
         for f in self.layout.visible:
-            if f.x <= wx <= f.x + NODE_W and f.y <= wy <= f.y + f.h:
+            if f.x <= wx <= f.x + f.w and f.y <= wy <= f.y + f.h:
                 return f
+        return None
+
+    def _code_line_center_y(self, f, lineno):
+        """World y of the center of a source line inside f's code node, or None
+        when that line is not currently shown."""
+        base = f.code_base
+        if base is None:
+            return None
+        rel = lineno - base
+        if 0 <= rel < f.code_nlines:
+            return f.y + HEADER_H + CODE_PAD_TOP + rel * CODE_LINE_H + CODE_LINE_H / 2
         return None
 
     def _row_index_at(self, f, wy):
@@ -762,17 +1017,34 @@ class Viewer:
             pass  # right press begins a pan; back is on release-less Backspace
         if pr.is_key_pressed(pr.KEY_F):
             self.fit_all()
+        if pr.is_key_pressed(pr.KEY_C):
+            self.toggle_code_view()
 
         # hover
         world = pr.get_screen_to_world_2d(pr.Vector2(mx, my), self.cam)
+        self.mouse_world = (world.x, world.y)
         self.hover_func = self._func_at(world.x, world.y)
 
     def _on_click(self, mx, my):
         world = pr.get_screen_to_world_2d(pr.Vector2(mx, my), self.cam)
+
+        # code view: a click on a highlighted call token re-roots on the
+        # function that call is made FROM, highlighting the callee (same
+        # semantics as clicking a call row in list view).
+        if self.code_view:
+            for (hx, hy, hw, hh, caller, call) in self.code_hits:
+                if hx <= world.x <= hx + hw and hy <= world.y <= hy + hh:
+                    self.focus(caller, highlight=call.callee)
+                    return
+
         f = self._func_at(world.x, world.y)
         if f is None or f.kind == "module":
             return
-        # if a specific call row was hit, remember its callee to highlight
+        if self.code_view:
+            # clicked the node but not a call -> just focus it
+            self.focus(f)
+            return
+        # list view: if a specific call row was hit, remember its callee
         highlight = None
         idx = self._row_index_at(f, world.y)
         if idx is not None and idx < len(f.calls):
@@ -812,13 +1084,21 @@ class Viewer:
         i = min(i, max(n - 1, 0))
         return f.y + HEADER_H + PAD_TOP + i * ROW_H + ROW_H / 2
 
+    def _edge_anchor_y(self, f, call, i):
+        if self.code_view:
+            y = self._code_line_center_y(f, call.lineno)
+            if y is not None:
+                return y
+            return f.y + f.h / 2          # call not on a shown line
+        return self._row_center_y(f, i)
+
     def _draw_edges(self):
         for f in self.layout.visible:
             for i, call in enumerate(f.calls):
                 g = call.callee
                 if g is None or not g.visible:
                     continue
-                start = pr.Vector2(f.x + NODE_W, self._row_center_y(f, i))
+                start = pr.Vector2(f.x + f.w, self._edge_anchor_y(f, call, i))
                 end = pr.Vector2(g.x, g.y + HEADER_H / 2)
                 if (self.mode == "function" and f is self.root
                         and g is self.highlight):
@@ -833,9 +1113,10 @@ class Viewer:
                 pr.draw_line_bezier(start, end, thick, color)
 
     def _draw_nodes(self):
+        self.code_hits = []        # rebuilt every frame (code view only)
         for f in self.layout.visible:
             rgb = self._module_color(f.module)
-            rec = pr.Rectangle(f.x, f.y, NODE_W, f.h)
+            rec = pr.Rectangle(f.x, f.y, f.w, f.h)
             pr.draw_rectangle_rec(rec, self._col((252, 252, 253)))
 
             is_root = (self.mode == "function" and f is self.root)
@@ -851,42 +1132,136 @@ class Viewer:
             pr.draw_rectangle_lines_ex(rec, bt, border)
 
             # header
-            hdr = pr.Rectangle(f.x, f.y, NODE_W, HEADER_H)
+            hdr = pr.Rectangle(f.x, f.y, f.w, HEADER_H)
             pr.draw_rectangle_rec(hdr, self._col(rgb, 235 if f.kind != "module" else 255))
             label = f.qualname
             if f.kind == "module":
                 label = "\u27e8module\u27e9 " + f.module.name
-            label = self._fit_text(label, NODE_W - 16, TITLE_FS)
+            label = self._fit_text(label, f.w - 16, TITLE_FS)
             pr.draw_text(label, int(f.x + 8), int(f.y + 7), TITLE_FS,
                          self._col((255, 255, 255)))
 
-            # call rows
-            n, overflow = displayed_rows(f)
-            if not f.calls:
-                pr.draw_text("(no calls)", int(f.x + 10),
-                             int(f.y + HEADER_H + PAD_TOP + 2), ROW_FS,
-                             self._col((160, 165, 175)))
-            for i in range(n):
-                call = f.calls[i]
-                ry = f.y + HEADER_H + PAD_TOP + i * ROW_H
-                if call.resolved:
-                    txt = "\u2192 " + call.callee.qualname
-                    if call.callee.module is not f.module:
-                        txt = "\u2192 " + call.callee.module.name + "." + call.callee.qualname
-                    col = self._col((40, 50, 65))
-                else:
-                    txt = "  " + call.raw_name
-                    col = self._col((165, 170, 180))
-                if self.hover_func is f and 0 <= (self._hover_row) < n and self._hover_row == i:
-                    pr.draw_rectangle_rec(
-                        pr.Rectangle(f.x + 2, ry, NODE_W - 4, ROW_H),
-                        self._col(rgb, 40))
-                txt = self._fit_text(txt, NODE_W - 20, ROW_FS)
-                pr.draw_text(txt, int(f.x + 10), int(ry + 3), ROW_FS, col)
-            if overflow > 0:
-                ry = f.y + HEADER_H + PAD_TOP + n * ROW_H
-                pr.draw_text("+%d more\u2026" % overflow, int(f.x + 10),
-                             int(ry + 3), ROW_FS, self._col((150, 155, 165)))
+            if self.code_view:
+                self._draw_code_body(f, rgb)
+            else:
+                self._draw_list_body(f, rgb)
+
+    def _draw_list_body(self, f, rgb):
+        n, overflow = displayed_rows(f)
+        if not f.calls:
+            pr.draw_text("(no calls)", int(f.x + 10),
+                         int(f.y + HEADER_H + PAD_TOP + 2), ROW_FS,
+                         self._col((160, 165, 175)))
+        for i in range(n):
+            call = f.calls[i]
+            ry = f.y + HEADER_H + PAD_TOP + i * ROW_H
+            if call.resolved:
+                txt = "\u2192 " + call.callee.qualname
+                if call.callee.module is not f.module:
+                    txt = "\u2192 " + call.callee.module.name + "." + call.callee.qualname
+                col = self._col((40, 50, 65))
+            else:
+                txt = "  " + call.raw_name
+                col = self._col((165, 170, 180))
+            if self.hover_func is f and 0 <= self._hover_row < n and self._hover_row == i:
+                pr.draw_rectangle_rec(
+                    pr.Rectangle(f.x + 2, ry, f.w - 4, ROW_H),
+                    self._col(rgb, 40))
+            txt = self._fit_text(txt, f.w - 20, ROW_FS)
+            pr.draw_text(txt, int(f.x + 10), int(ry + 3), ROW_FS, col)
+        if overflow > 0:
+            ry = f.y + HEADER_H + PAD_TOP + n * ROW_H
+            pr.draw_text("+%d more\u2026" % overflow, int(f.x + 10),
+                         int(ry + 3), ROW_FS, self._col((150, 155, 165)))
+
+    def _draw_code_body(self, f, rgb):
+        rows = f.code_rows or []
+        if not rows:
+            pr.draw_text("(no source)", int(f.x + 10),
+                         int(f.y + HEADER_H + CODE_PAD_TOP + 2), CODE_FS,
+                         self._col((160, 165, 175)))
+            return
+
+        gutter_w = self._gutter_w(f)
+        body_top = f.y + HEADER_H + CODE_PAD_TOP
+        num_right = f.x + CODE_PAD_X + gutter_w
+        code_left = num_right + CODE_GUTTER_GAP
+        body_right = f.x + f.w - CODE_PAD_X
+
+        # group call sites by the source line they start on
+        calls_by_line = defaultdict(list)
+        for call in f.calls:
+            calls_by_line[call.lineno].append(call)
+
+        for row, (lineno, raw) in enumerate(rows):
+            ly = body_top + row * CODE_LINE_H
+            disp = raw.expandtabs(4)
+
+            # line-number gutter (right-aligned)
+            num = str(lineno)
+            pr.draw_text(num, int(num_right - self._text_w(num, CODE_FS)),
+                         int(ly), CODE_FS, self._col((175, 180, 190)))
+
+            # call highlights (drawn behind the code text)
+            for call in calls_by_line.get(lineno, ()):  # only lines starting here
+                self._draw_call_token(f, call, raw, ly, code_left, body_right)
+
+            # code text, truncated to the node's inner width
+            text = self._fit_text(disp, body_right - code_left, CODE_FS)
+            pr.draw_text(text, int(code_left), int(ly), CODE_FS,
+                         self._col((45, 52, 66)))
+
+        if f.code_overflow > 0:
+            oy = body_top + len(rows) * CODE_LINE_H
+            pr.draw_text("+%d more lines\u2026" % f.code_overflow,
+                         int(code_left), int(oy), CODE_FS,
+                         self._col((150, 155, 165)))
+
+    def _draw_call_token(self, f, call, raw, ly, code_left, body_right):
+        """Highlight one call's callee expression on its line and register it as
+        a clickable region. Tokens spanning multiple lines are clamped to the
+        first line; tokens past the node's right edge are skipped."""
+        c0 = max(0, min(call.col_offset, len(raw)))
+        if call.end_lineno == call.lineno:
+            c1 = max(c0, min(call.end_col_offset, len(raw)))
+        else:
+            c1 = len(raw)
+        if c1 <= c0:
+            return
+
+        pre_w = self._text_w(raw[:c0].expandtabs(4), CODE_FS)
+        tok_w = self._text_w(raw[c0:c1].expandtabs(4), CODE_FS)
+        tx = code_left + pre_w
+        if tok_w <= 0 or tx >= body_right:
+            return
+        if tx + tok_w > body_right:          # partly clipped -> not clickable
+            return
+
+        hovered = (self._hover_call is call)
+        is_focus_hi = (f is self.root and call.callee is self.highlight)
+        if call.resolved:
+            if is_focus_hi:
+                fill = self._col((235, 150, 40), 150 if hovered else 90)
+                line = self._col((235, 150, 40), 220)
+            else:
+                fill = self._col((90, 150, 235), 140 if hovered else 70)
+                line = self._col((90, 150, 235), 200 if hovered else 120)
+        else:
+            fill = self._col((150, 150, 160), 80 if hovered else 36)
+            line = self._col((150, 150, 160), 120 if hovered else 60)
+
+        rect = pr.Rectangle(tx - 1, ly - 1, tok_w + 2, CODE_LINE_H)
+        pr.draw_rectangle_rec(rect, fill)
+        pr.draw_rectangle_lines_ex(rect, 1.0, line)
+        self.code_hits.append((tx - 1, ly - 1, tok_w + 2, CODE_LINE_H, f, call))
+
+    def _gutter_w(self, f):
+        last = f.code_rows[-1][0] if f.code_rows else (f.code_base or 1)
+        return self._text_w(str(last), CODE_FS)
+
+    @staticmethod
+    def _text_w(s, size):
+        return _text_w(s, size)
 
     def _draw_hud(self):
         # top bar
@@ -895,9 +1270,11 @@ class Viewer:
             crumb = "Overview  \u2022  %s" % self.project.main.name
         else:
             crumb = "Focus  \u2022  %s.%s" % (self.root.module.name, self.root.qualname)
+        crumb += "   [%s]" % ("code" if self.code_view else "calls")
         pr.draw_text(crumb, 12, 11, 18, self._col((255, 255, 255)))
-        hint = ("click node: focus   drag: pan   wheel: zoom   "
-                "Backspace: back   Home: overview   F: fit   Esc: quit")
+        hint = ("click: focus   drag: pan   wheel: zoom   C: %s   "
+                "Backspace: back   Home: overview   F: fit   Esc: quit"
+                % ("call list" if self.code_view else "code view"))
         hw = pr.measure_text(hint, 12)
         pr.draw_text(hint, self.WIN_W - hw - 12, 14, 12, self._col((170, 178, 190)))
 
@@ -917,9 +1294,16 @@ class Viewer:
             self._handle_input()
             self._ease_camera()
 
-            # precompute which row is hovered (used while drawing rows)
+            # precompute hover state used while drawing
             self._hover_row = -1
-            if self.hover_func is not None:
+            self._hover_call = None
+            if self.code_view:
+                wx, wy = self.mouse_world
+                for (hx, hy, hw, hh, caller, call) in self.code_hits:
+                    if hx <= wx <= hx + hw and hy <= wy <= hy + hh:
+                        self._hover_call = call
+                        break
+            elif self.hover_func is not None:
                 world = pr.get_screen_to_world_2d(pr.get_mouse_position(), self.cam)
                 ri = self._row_index_at(self.hover_func, world.y)
                 self._hover_row = ri if ri is not None else -1
