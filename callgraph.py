@@ -58,15 +58,13 @@ import sys
 import math
 from collections import deque, defaultdict
 
-# # raylib is only needed for the GUI. Guard the import so the parser/layout can
-# # be exercised head-less (e.g. with --dump, or in tests).
-# try:
-#     import pyray as pr
-# except Exception:  # pragma: no cover - depends on local install
-#     pr = None
-import pyray as pr
+# raylib is only needed for the GUI. Guard the import so the parser/layout can
+# be exercised head-less (e.g. with --dump, or in tests).
+try:
+    import pyray as pr
+except Exception:  # pragma: no cover - depends on local install
+    pr = None
 
-font = pr.load_font_ex("CascadiaCode.ttf", 20, None, 0)
 
 # --------------------------------------------------------------------------- #
 #  Data model: Module / Function / Call
@@ -491,11 +489,32 @@ def _clampf(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
 
+# Active font for on-screen text. None => raylib's built-in default font.
+# To use a custom font, load it in Viewer.run() (see the marked hook there) and
+# assign it here. Measuring (_text_w) and drawing (_draw_text) both go through
+# this single font, so code-view call-token highlights stay aligned with the
+# rendered text no matter which font is active.
+_FONT = None
+_SPACING = 1.0
+
+
 def _text_w(s, size):
-    """Pixel width of a string in the default font (estimate when head-less)."""
-    if pr is not None:
-        return float(pr.measure_text_ex(font, s, size, 0).x)
-    return float(len(s)) * size * 0.55
+    """Pixel width of a string in the active font (estimate when head-less)."""
+    if pr is None:
+        return float(len(s)) * size * 0.55
+    if _FONT is None:
+        return float(pr.measure_text(s, size))
+    return float(pr.measure_text_ex(_FONT, s, float(size), _SPACING).x)
+
+
+def _draw_text(s, x, y, size, color):
+    """Draw text in the active font, consistently with _text_w so measured
+    widths match rendered widths (critical for code-view highlight alignment)."""
+    if _FONT is None:
+        pr.draw_text(s, int(x), int(y), int(size), color)
+    else:
+        pr.draw_text_ex(_FONT, s, pr.Vector2(float(x), float(y)),
+                        float(size), _SPACING, color)
 
 
 def function_span(f):
@@ -938,7 +957,6 @@ class Viewer:
 
         self.hover_func = None
         self.module_colors = {}
-        self.fonts = {}
 
     # ---- colour bookkeeping --------------------------------------------- #
     def _module_color(self, module):
@@ -992,8 +1010,11 @@ class Viewer:
         self.root = func
         self.selected = func
         self.layout.build_focus(func, node_mode=self.node_mode)
-        # place the focused node near the top-left of the screen
-        self.goal_target = (func.x - 12.0, func.y - 12.0)
+        # Frame the top-left-most node -- the first caller in column 0 -- so the
+        # callers are visible on the left rather than off-screen. (With no
+        # callers this is the focused node itself.)
+        anchor = min(self.layout.visible, key=lambda f: (f.x, f.y), default=func)
+        self.goal_target = (anchor.x - 12.0, anchor.y - 12.0)
         self.goal_zoom = 1.0
         self.animating = True
 
@@ -1178,17 +1199,13 @@ class Viewer:
     def _col(rgb, a=255):
         return pr.Color(int(rgb[0]), int(rgb[1]), int(rgb[2]), int(a))
 
-    def _fit_text(self, s, max_w, size):
-        if pr.measure_text_ex(self._font(size), s, size, 0).x <= max_w:
+    @staticmethod
+    def _fit_text(s, max_w, size):
+        if _text_w(s, size) <= max_w:
             return s
-        while s and pr.measure_text_ex(self._font(size), s + "...", size, 0).x > max_w:
+        while s and _text_w(s + "...", size) > max_w:
             s = s[:-1]
         return s + "..."
-
-    def _font(self, size):
-        if size not in self.fonts:
-            self.fonts[size] = pr.load_font_ex("CascadiaCode.ttf", size, None, 0)
-        return self.fonts[size]
 
     def _draw_frames(self):
         for module, x, y, w, h in self.layout.frames:
@@ -1198,10 +1215,10 @@ class Viewer:
             pr.draw_rectangle_lines_ex(rec, 2.0, self._col(rgb, 150))
             # title tab
             title = module.name + (" (external)" if module.external else ".py")
-            tw = pr.measure_text_ex(self._font(FRAME_FS), title, FRAME_FS, 0).x + 20
+            tw = _text_w(title, FRAME_FS) + 20
             tab = pr.Rectangle(x, y, float(tw), FRAME_HEADER)
             pr.draw_rectangle_rec(tab, self._col(rgb, 210))
-            pr.draw_text_ex(self._font(FRAME_FS), title, (int(x + 10), int(y + 6)), FRAME_FS, 0,
+            _draw_text(title, int(x + 10), int(y + 6), FRAME_FS,
                          self._col((255, 255, 255)))
 
     def _row_center_y(self, f, i):
@@ -1264,7 +1281,8 @@ class Viewer:
             if f.kind == "module":
                 label = "<module> " + f.module.name
             label = self._fit_text(label, f.w - 16, TITLE_FS)
-            pr.draw_text_ex(self._font(TITLE_FS), label, (int(f.x + 8), int(f.y + 7)), TITLE_FS, 0, self._col((255, 255, 255)))
+            _draw_text(label, int(f.x + 8), int(f.y + 7), TITLE_FS,
+                         self._col((255, 255, 255)))
 
             if self.node_mode == "code":
                 self._draw_code_body(f, rgb)
@@ -1275,7 +1293,8 @@ class Viewer:
     def _draw_list_body(self, f, rgb):
         n, overflow = displayed_rows(f)
         if not f.calls:
-            pr.draw_text_ex(self._font(ROW_FS), "(no calls)", (int(f.x + 10), int(f.y + HEADER_H + PAD_TOP + 2)), ROW_FS, 0,
+            _draw_text("(no calls)", int(f.x + 10),
+                         int(f.y + HEADER_H + PAD_TOP + 2), ROW_FS,
                          self._col((160, 165, 175)))
         for i in range(n):
             call = f.calls[i]
@@ -1293,18 +1312,18 @@ class Viewer:
                     pr.Rectangle(f.x + 2, ry, f.w - 4, ROW_H),
                     self._col(rgb, 40))
             txt = self._fit_text(txt, f.w - 20, ROW_FS)
-            pr.draw_text_ex(self._font(ROW_FS), txt, (int(f.x + 10), int(ry + 3)), ROW_FS, 0, col)
+            _draw_text(txt, int(f.x + 10), int(ry + 3), ROW_FS, col)
         if overflow > 0:
             ry = f.y + HEADER_H + PAD_TOP + n * ROW_H
-            pr.draw_text_ex(self._font(ROW_FS), "+%d more..." % overflow, (int(f.x + 10),
-                         int(ry + 3)), ROW_FS, 0, self._col((150, 155, 165)))
+            _draw_text("+%d more..." % overflow, int(f.x + 10),
+                         int(ry + 3), ROW_FS, self._col((150, 155, 165)))
 
     def _draw_code_body(self, f, rgb):
         rows = f.code_rows or []
         if not rows:
-            pr.draw_text_ex(self._font(CODE_FS), "(no source)", (int(f.x + 10),
-                         int(f.y + HEADER_H + CODE_PAD_TOP + 2)), CODE_FS,
-                         self._0, col((160, 165, 175)))
+            _draw_text("(no source)", int(f.x + 10),
+                         int(f.y + HEADER_H + CODE_PAD_TOP + 2), CODE_FS,
+                         self._col((160, 165, 175)))
             return
 
         gutter_w = self._gutter_w(f)
@@ -1324,8 +1343,8 @@ class Viewer:
 
             # line-number gutter (right-aligned)
             num = str(lineno)
-            pr.draw_text_ex(self._font(CODE_FS), num, (int(num_right - self._text_w(num, CODE_FS)),
-                         int(ly)), CODE_FS, 0, self._col((175, 180, 190)))
+            _draw_text(num, int(num_right - self._text_w(num, CODE_FS)),
+                         int(ly), CODE_FS, self._col((175, 180, 190)))
 
             # call highlights (drawn behind the code text)
             for call in calls_by_line.get(lineno, ()):  # only lines starting here
@@ -1333,13 +1352,13 @@ class Viewer:
 
             # code text, truncated to the node's inner width
             text = self._fit_text(disp, body_right - code_left, CODE_FS)
-            pr.draw_text_ex(self._font(CODE_FS), text, (int(code_left), int(ly)), CODE_FS, 0,
+            _draw_text(text, int(code_left), int(ly), CODE_FS,
                          self._col((45, 52, 66)))
 
         if f.code_overflow > 0:
             oy = body_top + len(rows) * CODE_LINE_H
-            pr.draw_text_ex(self._font(CODE_FS), "+%d more lines..." % f.code_overflow,
-                         (int(code_left), int(oy)), CODE_FS, 0,
+            _draw_text("+%d more lines..." % f.code_overflow,
+                         int(code_left), int(oy), CODE_FS,
                          self._col((150, 155, 165)))
 
     def _draw_call_token(self, f, call, raw, ly, code_left, body_right):
@@ -1396,20 +1415,35 @@ class Viewer:
         else:
             crumb = "Focus  -  %s.%s" % (self.root.module.name, self.root.qualname)
         crumb += "   [%s]" % self.node_mode
-        hud_crumb_fs = 18
-        pr.draw_text_ex(self._font(hud_crumb_fs), crumb, (12, 11), hud_crumb_fs, 0, self._col((255, 255, 255)))
-        hint = ("L-click: focus   R-click call: open callee   drag: pan   "
-                "wheel: zoom   C: mode (calls/code/compact)   "
+        _draw_text(crumb, 12, 11, 18, self._col((255, 255, 255)))
+        hint = ("click: select   click again: zoom   R-click call: open callee   "
+                "drag: pan   wheel: zoom   C: mode (calls/code/compact)   "
                 "Backspace: back   Home: overview   F: fit   Esc: quit")
-        hud_hint_fs = 12
-        hw = pr.measure_text_ex(self._font(hud_hint_fs), hint, hud_hint_fs, 0).x
-        pr.draw_text_ex(self._font(hud_hint_fs), hint, (self.WIN_W - hw - hud_hint_fs, 14), hud_hint_fs, 0, self._col((170, 178, 190)))
+        hw = _text_w(hint, 12)
+        _draw_text(hint, self.WIN_W - hw - 12, 14, 12, self._col((170, 178, 190)))
 
     # ---- main loop ------------------------------------------------------- #
     def run(self):
         pr.set_config_flags(pr.FLAG_WINDOW_RESIZABLE | pr.FLAG_MSAA_4X_HINT)
         pr.init_window(self.WIN_W, self.WIN_H, "callgraph - %s" % self.project.main.name)
         pr.set_target_fps(60)
+
+        # ---- font hook ---------------------------------------------------- #
+        # All on-screen text goes through _text_w/_draw_text, which use the
+        # module-level _FONT. Leaving it None uses raylib's built-in font. To
+        # use a custom font, load it HERE (needs the window/GL context) and set
+        # _FONT + _SPACING; because measuring and drawing share this font,
+        # code-view call-token highlights stay aligned automatically. Example:
+        #     global _FONT, _SPACING
+        #     _FONT = pr.load_font_ex("MyMono.ttf", 32, None, 0)
+        #     pr.set_texture_filter(_FONT.texture, pr.TEXTURE_FILTER_BILINEAR)
+        #     _SPACING = 0.5
+        # (A monospaced font is recommended for the code view.)
+        global _FONT, _SPACING
+        _FONT = pr.load_font_ex("CascadiaCode.ttf", 32, None, 0)
+        pr.set_texture_filter(_FONT.texture, pr.TEXTURE_FILTER_BILINEAR)
+        _SPACING = 0.5
+
         self.cam = pr.Camera2D(pr.Vector2(self.OFFSET_X, self.OFFSET_Y),
                                pr.Vector2(0, 0), 0.0, 1.0)
         self.prev_mouse = (pr.get_mouse_position().x, pr.get_mouse_position().y)
