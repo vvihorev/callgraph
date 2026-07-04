@@ -955,6 +955,77 @@ class Viewer:
 
         self.hover_func = None
         self.module_colors = {}
+        self.quit = False
+
+        # search-mode state
+        self.search_active = False
+        self.search_query = ""
+        self.search_results = []   # list[Function]
+        self.search_index = 0
+        self.search_funcs = [f for m in project.modules.values()
+                             if not m.external
+                             for f in m.functions.values()
+                             if f.kind != "module"]
+
+    # ---- search ---------------------------------------------------------- #
+    def _open_search(self):
+        self.search_active = True
+        self.search_query = ""
+        self.search_results = []
+        self.search_index = 0
+        while pr.get_char_pressed() != 0:   # drop the '/' that opened search
+            pass
+
+    def _close_search(self):
+        self.search_active = False
+        self.search_query = ""
+        self.search_results = []
+        self.search_index = 0
+
+    def _recompute_search(self):
+        q = self.search_query.strip().lower()
+        if not q:
+            self.search_results = []
+            return
+        scored = []
+        for f in self.search_funcs:
+            name = f.qualname.lower()
+            full = (f.module.name + "." + f.qualname).lower()
+            if q in name or q in full:
+                rank = 0 if name.startswith(q) else (1 if full.startswith(q) else 2)
+                scored.append((rank, f.module is not self.project.main,
+                               len(f.qualname), full, f))
+        scored.sort(key=lambda t: t[:4])
+        self.search_results = [t[4] for t in scored[:12]]
+        self.search_index = 0
+
+    def _update_search(self):
+        changed = False
+        c = pr.get_char_pressed()
+        while c != 0:
+            if 32 <= c < 127:
+                self.search_query += chr(c)
+                changed = True
+            c = pr.get_char_pressed()
+        if pr.is_key_pressed(pr.KEY_BACKSPACE) and self.search_query:
+            self.search_query = self.search_query[:-1]
+            changed = True
+        if changed:
+            self._recompute_search()
+
+        n = len(self.search_results)
+        if pr.is_key_pressed(pr.KEY_DOWN) and n:
+            self.search_index = (self.search_index + 1) % n
+        if pr.is_key_pressed(pr.KEY_UP) and n:
+            self.search_index = (self.search_index - 1) % n
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_LEFT_CONTROL) and pr.is_key_pressed(pr.KeyboardKey.KEY_N) and n:
+            self.search_index = (self.search_index - 1) % n
+        if pr.is_key_pressed(pr.KEY_ENTER) or pr.is_key_pressed(pr.KEY_KP_ENTER):
+            if self.search_results:
+                self.focus(self.search_results[self.search_index])
+            self._close_search()
+        if pr.is_key_pressed(pr.KEY_ESCAPE):
+            self._close_search()
 
     # ---- colour bookkeeping --------------------------------------------- #
     def _module_color(self, module):
@@ -1086,6 +1157,10 @@ class Viewer:
         dy = my - self.prev_mouse[1]
         self.prev_mouse = (mx, my)
 
+        if self.search_active:      # typing a query swallows normal shortcuts
+            self._update_search()
+            return
+
         # zoom to cursor
         wheel = pr.get_mouse_wheel_move()
         if wheel != 0:
@@ -1148,6 +1223,10 @@ class Viewer:
             self.fit_all()
         if pr.is_key_pressed(pr.KEY_C):
             self.cycle_node_mode()
+        if pr.is_key_pressed(pr.KEY_SLASH):
+            self._open_search()
+        if pr.is_key_pressed(pr.KEY_ESCAPE):
+            self.quit = True
 
         # hover
         world = pr.get_screen_to_world_2d(pr.Vector2(mx, my), self.cam)
@@ -1408,10 +1487,46 @@ class Viewer:
         _draw_text(crumb, 12, 11, 18, self._col((255, 255, 255)))
         hint = ("click: select   dbl-click: open (call->callee, node->zoom)   "
                 "R-click call: callee   drag: pan   wheel: zoom   "
-                "C: mode (calls/code/compact)   "
+                "C: mode   /: search   "
                 "Backspace: back   Home: overview   F: fit   Esc: quit")
         hw = _text_w(hint, 12)
         _draw_text(hint, self.WIN_W - hw - 12, 14, 12, self._col((170, 178, 190)))
+
+    def _draw_search(self):
+        if not self.search_active:
+            return
+        x, y = 12, 48
+        w = 560
+        rows = self.search_results
+        row_h = 24
+        h = 40 + max(len(rows), 1) * row_h + 8
+
+        pr.draw_rectangle(x, y, w, h, self._col((24, 27, 34), 245))
+        pr.draw_rectangle_lines_ex(pr.Rectangle(x, y, w, h), 1.0,
+                                   self._col((90, 150, 235), 220))
+
+        # query line with a blinking caret
+        caret = "_" if (int(pr.get_time() * 2) % 2 == 0) else " "
+        _draw_text("Search: " + self.search_query + caret,
+                   x + 12, y + 10, 18, self._col((255, 255, 255)))
+
+        ly = y + 38
+        if not rows:
+            msg = "type to search functions" if not self.search_query else "no matches"
+            _draw_text(msg, x + 12, ly + 3, 14, self._col((150, 155, 165)))
+        else:
+            for i, f in enumerate(rows):
+                if i == self.search_index:
+                    pr.draw_rectangle(x + 4, ly - 2, w - 8, row_h,
+                                      self._col((90, 150, 235), 60))
+                rgb = self._module_color(f.module)
+                pr.draw_rectangle(x + 10, ly + 3, 10, 10, self._col(rgb, 255))
+                label = "%s.%s" % (f.module.name, f.qualname)
+                _draw_text(label, x + 28, ly + 2, 15, self._col((235, 238, 244)))
+                ly += row_h
+
+        tip = "Up/Down: move   Enter: focus   Esc: cancel"
+        _draw_text(tip, x + 12, y + h - 20, 12, self._col((140, 146, 158)))
 
     # ---- main loop ------------------------------------------------------- #
     def run(self):
@@ -1437,10 +1552,11 @@ class Viewer:
 
         self.cam = pr.Camera2D(pr.Vector2(self.OFFSET_X, self.OFFSET_Y),
                                pr.Vector2(0, 0), 0.0, 1.0)
+        pr.set_exit_key(pr.KEY_NULL)      # ESC is handled manually (closes search / quits)
         self.prev_mouse = (pr.get_mouse_position().x, pr.get_mouse_position().y)
         self.show_overview(record=False)
 
-        while not pr.window_should_close():
+        while not pr.window_should_close() and not self.quit:
             self.WIN_W = pr.get_screen_width()
             self.WIN_H = pr.get_screen_height()
             self._handle_input()
@@ -1468,6 +1584,7 @@ class Viewer:
             self._draw_nodes()
             pr.end_mode_2d()
             self._draw_hud()
+            self._draw_search()
             pr.end_drawing()
 
         pr.close_window()
