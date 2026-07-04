@@ -670,8 +670,6 @@ class Layout:
         self.visible = []          # list[Function]
         self.frames = []           # list[(Module, x, y, w, h)]
         self.node_mode = "calls"   # "calls" | "code" | "compact"
-        self.colx = {}             # column index -> world x of that column
-        self.colw = {}             # column index -> width of that column
 
     def build(self, sources, include_all_main=False, node_mode="calls"):
         self.node_mode = node_mode
@@ -703,14 +701,13 @@ class Layout:
 
         self._place_modules()
 
-    # -- module placement (left-to-right) ---------------------------------- #
-    def _module_order(self, by_module):
-        """Left-to-right module order: main first, then each module placed to
-        the right of every module that calls it (longest path over the
-        module-dependency graph), external modules last. Because a caller
-        module always has a strictly smaller distance than a module it calls,
-        callee modules land further right and cross-module edges point
-        rightward (module cycles aside)."""
+    # -- module placement (2D: depth = column, siblings stack in rows) ------ #
+    def _module_super_columns(self, by_module):
+        """Group modules into left-to-right 'super-columns' by their call depth
+        from main (longest path over the module-dependency graph). Modules at
+        the same depth -- e.g. two modules both called only by main -- share a
+        super-column and are stacked vertically instead of marching further
+        right. Returns a list of module lists, ordered left to right."""
         main = self.project.main
         dep = defaultdict(set)
         for f in self.visible:
@@ -734,59 +731,80 @@ class Layout:
             if not changed:
                 break
 
-        others = [m for m in by_module if m is not main]
-        others.sort(key=lambda m: (1 if m.external else 0,
-                                    dist.get(m, 1_000_000), m.name))
-        return [main] + others
+        groups = defaultdict(list)
+        placed = set()
+        for m in by_module:
+            if m in dist:
+                groups[dist[m]].append(m)
+                placed.add(m)
+
+        result = []
+        for d in sorted(groups):
+            result.append(sorted(groups[d],
+                                  key=lambda m: (1 if m.external else 0, m.name)))
+        # any module unreachable from main (e.g. isolated cycle) -> rightmost
+        leftovers = [m for m in by_module if m not in placed]
+        if leftovers:
+            result.append(sorted(leftovers,
+                                  key=lambda m: (1 if m.external else 0, m.name)))
+        return result
+
+    def _layout_one_module(self, m, funcs, ox, oy):
+        """Position a single module's functions with the band's top-left at
+        (ox, oy); return the band's (width, height). Functions are laid out by
+        their (compressed) call column so intra-module edges flow rightward."""
+        cols = sorted({f.col for f in funcs})
+        local = {c: i for i, c in enumerate(cols)}
+        per_local = defaultdict(list)
+        for f in funcs:
+            per_local[local[f.col]].append(f)
+
+        colw = {lc: max(f.w for f in per_local[lc]) for lc in per_local}
+        colx = {}
+        cx = ox + FRAME_PAD
+        for lc in sorted(colw):
+            colx[lc] = cx
+            cx += colw[lc] + H_GAP
+        inner_right = cx - H_GAP
+
+        inner_top = oy + FRAME_HEADER + FRAME_PAD
+        band_bottom = inner_top
+        for lc in sorted(per_local):
+            y = inner_top
+            for f in sorted(per_local[lc],
+                            key=lambda fn: (fn.kind != "module", fn.qualname)):
+                f.x = colx[lc]
+                f.y = y
+                y += f.h + V_GAP
+            band_bottom = max(band_bottom, y)
+
+        fw = (inner_right + FRAME_PAD) - ox
+        fh = (band_bottom - oy) + FRAME_PAD - V_GAP
+        return fw, fh
 
     def _place_modules(self):
-        """Tile modules left-to-right, each in its own horizontal band sharing
-        the same top, so called modules sit to the right of the main module
-        instead of being stacked below it. Within a band, functions are laid
-        out by their (compressed) call column, so intra-module edges still flow
-        rightward; since bands occupy disjoint horizontal ranges, frames never
-        overlap and every forward edge points right."""
+        """Lay modules out as a 2D grid: horizontal position is a module's call
+        depth from main (its super-column), and modules sharing a depth stack
+        vertically within that super-column. So a module called by main sits in
+        the second column regardless of how many other modules main also calls;
+        only modules called by *those* modules move further right. Cross-module
+        edges still point rightward, and because same-depth modules never call
+        each other, stacking them introduces no sideways edges."""
         by_module = defaultdict(list)
         for f in self.visible:
             by_module[f.module].append(f)
 
         self.frames = []
-        top_y = 0.0
-        cursor_x = NODE_X0                    # left edge of the next band
-        for m in self._module_order(by_module):
-            funcs = by_module[m]
-            # compress this module's global columns to dense local columns
-            cols = sorted({f.col for f in funcs})
-            local = {c: i for i, c in enumerate(cols)}
-            per_local = defaultdict(list)
-            for f in funcs:
-                per_local[local[f.col]].append(f)
-
-            # local-column widths, then x positions inside this band
-            colw = {lc: max(f.w for f in per_local[lc]) for lc in per_local}
-            colx = {}
-            cx = cursor_x + FRAME_PAD
-            for lc in sorted(colw):
-                colx[lc] = cx
-                cx += colw[lc] + H_GAP
-            inner_right = cx - H_GAP          # right edge of last column
-
-            inner_top = top_y + FRAME_HEADER + FRAME_PAD
-            band_bottom = inner_top
-            for lc in sorted(per_local):
-                y = inner_top
-                for f in sorted(per_local[lc],
-                                key=lambda fn: (fn.kind != "module", fn.qualname)):
-                    f.x = colx[lc]
-                    f.y = y
-                    y += f.h + V_GAP
-                band_bottom = max(band_bottom, y)
-
-            fx = cursor_x
-            fw = (inner_right + FRAME_PAD) - cursor_x
-            fh = (band_bottom - top_y) + FRAME_PAD - V_GAP
-            self.frames.append((m, fx, top_y, fw, fh))
-            cursor_x = fx + fw + LANE_GAP     # next module to the right
+        cursor_x = NODE_X0
+        for group in self._module_super_columns(by_module):
+            col_top = 0.0
+            col_w = 0.0
+            for m in group:
+                fw, fh = self._layout_one_module(m, by_module[m], cursor_x, col_top)
+                self.frames.append((m, cursor_x, col_top, fw, fh))
+                col_top += fh + LANE_GAP
+                col_w = max(col_w, fw)
+            cursor_x += col_w + LANE_GAP     # next super-column to the right
 
     # -- bounds ------------------------------------------------------------ #
     def bounds(self):
