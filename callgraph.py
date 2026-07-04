@@ -935,6 +935,7 @@ class Viewer:
         self.node_mode = "calls"   # "calls" | "code" | "compact"
         self.root = None           # focused Function in function mode
         self.selected = None       # single-clicked node (edges highlighted)
+        self.armed = None          # last single-clicked focus target (Call or Function)
         self.history = []          # stack of (mode, root) focus states only
 
         # code-view interaction
@@ -975,6 +976,7 @@ class Viewer:
         self.mode = "module"
         self.root = None
         self.selected = None
+        self.armed = None
         sources = [self.project.main.module_node] + self.project.entrypoints()
         self.layout.build(sources, include_all_main=True, node_mode=self.node_mode)
         self.fit_all()
@@ -991,12 +993,9 @@ class Viewer:
     def cycle_node_mode(self):
         order = ("calls", "code", "compact")
         self.node_mode = order[(order.index(self.node_mode) + 1) % len(order)]
+        self.armed = None          # token/row hit-boxes change between modes
         self._rebuild_current()
         self.fit_all()
-
-    def select(self, func):
-        """First click: mark a node so its call edges stay highlighted."""
-        self.selected = func
 
     def focus(self, func, record=True):
         """Zoom in on a node: it moves to the second column with its callers in
@@ -1009,6 +1008,7 @@ class Viewer:
         self.mode = "function"
         self.root = func
         self.selected = func
+        self.armed = None
         self.layout.build_focus(func, node_mode=self.node_mode)
         # Frame the top-left-most node -- the first caller in column 0 -- so the
         # callers are visible on the left rather than off-screen. (With no
@@ -1157,42 +1157,65 @@ class Viewer:
         self.mouse_world = (world.x, world.y)
         self.hover_func = self._func_at(world.x, world.y)
 
+    def _call_at(self, wx, wy):
+        """Return (call, caller_func) for the call under the cursor, or None.
+        Uses the code-view token hit-boxes in code mode and the call rows in
+        calls mode; compact mode shows no calls."""
+        if self.node_mode == "code":
+            for (hx, hy, hw, hh, caller, call) in self.code_hits:
+                if hx <= wx <= hx + hw and hy <= wy <= hy + hh:
+                    return call, caller
+            return None
+        if self.node_mode == "calls":
+            f = self._func_at(wx, wy)
+            if f is not None:
+                idx = self._row_index_at(f, wy)
+                if idx is not None and idx < len(f.calls):
+                    return f.calls[idx], f
+        return None
+
     def _on_click(self, mx, my):
-        """Two-stage left click: the first click on a node selects it (its call
-        edges stay highlighted); a second click on the same node focuses it
-        (zoom in). Clicking empty space clears the selection."""
+        """Two-stage left click. The first click highlights its target; a second
+        click on the SAME target acts on it: a call opens its callee, a node
+        zooms in. This works on call tokens in code view and call rows in calls
+        view alike. Clicking empty space clears the selection."""
         world = pr.get_screen_to_world_2d(pr.Vector2(mx, my), self.cam)
+
+        hit = self._call_at(world.x, world.y)
+        if hit is not None:
+            call, caller = hit
+            self.selected = caller             # highlight the caller's edges
+            if self.armed is call:
+                if call.callee is not None:
+                    self.focus(call.callee)    # second click on a call -> open callee
+                self.armed = None
+            else:
+                self.armed = call              # first click -> arm this call
+            return
+
         f = self._func_at(world.x, world.y)
         if f is None:
             self.selected = None
+            self.armed = None
             return
         if f.kind == "module":
-            self.select(f)                 # highlight only; module node isn't focusable
+            self.selected = f                  # highlight only; not focusable
+            self.armed = None
             return
-        if f is self.selected and f is not self.root:
-            self.focus(f)                  # second click -> zoom in
+        self.selected = f
+        if self.armed is f and f is not self.root:
+            self.focus(f)                      # second click on a node -> zoom in
+            self.armed = None
         else:
-            self.select(f)                 # first click -> highlight its call edges
+            self.armed = f                     # first click -> arm this node
 
     def _on_right_click(self, mx, my):
-        """Right-clicking a call jumps straight to the CALLEE node -- the same
-        as clicking the called node itself. (Left-click selects/focuses the
-        node the call is made FROM.) Right-clicking anything else does nothing."""
+        """Right-clicking a call jumps straight to the CALLEE node in a single
+        click (a shortcut for the double-click-to-open-callee gesture)."""
         world = pr.get_screen_to_world_2d(pr.Vector2(mx, my), self.cam)
-        if self.node_mode == "code":
-            for (hx, hy, hw, hh, caller, call) in self.code_hits:
-                if hx <= world.x <= hx + hw and hy <= world.y <= hy + hh:
-                    self.focus(call.callee)      # focus() ignores None/external
-                    return
-            return
-        if self.node_mode == "calls":
-            f = self._func_at(world.x, world.y)
-            if f is None:
-                return
-            idx = self._row_index_at(f, world.y)
-            if idx is not None and idx < len(f.calls):
-                self.focus(f.calls[idx].callee)
-        # compact mode shows no calls -> nothing to focus
+        hit = self._call_at(world.x, world.y)
+        if hit is not None and hit[0].callee is not None:
+            self.focus(hit[0].callee)
 
     # ---- drawing --------------------------------------------------------- #
     @staticmethod
@@ -1416,8 +1439,9 @@ class Viewer:
             crumb = "Focus  -  %s.%s" % (self.root.module.name, self.root.qualname)
         crumb += "   [%s]" % self.node_mode
         _draw_text(crumb, 12, 11, 18, self._col((255, 255, 255)))
-        hint = ("click: select   click again: zoom   R-click call: open callee   "
-                "drag: pan   wheel: zoom   C: mode (calls/code/compact)   "
+        hint = ("click: select   dbl-click: open (call->callee, node->zoom)   "
+                "R-click call: callee   drag: pan   wheel: zoom   "
+                "C: mode (calls/code/compact)   "
                 "Backspace: back   Home: overview   F: fit   Esc: quit")
         hw = _text_w(hint, 12)
         _draw_text(hint, self.WIN_W - hw - 12, 14, 12, self._col((170, 178, 190)))
