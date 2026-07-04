@@ -57,14 +57,17 @@ import os
 import sys
 import math
 from collections import deque, defaultdict
+from typing import TYPE_CHECKING
 
-# raylib is only needed for the GUI. Guard the import so the parser/layout can
-# be exercised head-less (e.g. with --dump, or in tests).
-try:
-    import pyray as pr
-except Exception:  # pragma: no cover - depends on local install
-    pr = None
+# # raylib is only needed for the GUI. Guard the import so the parser/layout can
+# # be exercised head-less (e.g. with --dump, or in tests).
+# try:
+#     import pyray as pr
+# except Exception:  # pragma: no cover - depends on local install
+#     pr = None
+import pyray as pr
 
+font = pr.load_font_ex("CascadiaCode.ttf", 20, None, 0)
 
 # --------------------------------------------------------------------------- #
 #  Data model: Module / Function / Call
@@ -433,7 +436,7 @@ ROW_FS = 13
 FRAME_FS = 18
 
 # --- source-code view metrics --------------------------------------------- #
-CODE_FS = 13
+CODE_FS = 15
 CODE_LINE_H = 16.0
 CODE_PAD_X = 10.0
 CODE_PAD_TOP = 8.0
@@ -479,7 +482,7 @@ def _clampf(v, lo, hi):
 def _text_w(s, size):
     """Pixel width of a string in the default font (estimate when head-less)."""
     if pr is not None:
-        return float(pr.measure_text(s, size))
+        return float(pr.measure_text_ex(font, s, size, 0).x)
     return float(len(s)) * size * 0.55
 
 
@@ -903,6 +906,7 @@ class Viewer:
 
         self.hover_func = None
         self.module_colors = {}
+        self.fonts = {}
 
     # ---- colour bookkeeping --------------------------------------------- #
     def _module_color(self, module):
@@ -1145,13 +1149,17 @@ class Viewer:
     def _col(rgb, a=255):
         return pr.Color(int(rgb[0]), int(rgb[1]), int(rgb[2]), int(a))
 
-    @staticmethod
-    def _fit_text(s, max_w, size):
-        if pr.measure_text(s, size) <= max_w:
+    def _fit_text(self, s, max_w, size):
+        if pr.measure_text_ex(self._font(size), s, size, 0).x <= max_w:
             return s
-        while s and pr.measure_text(s + "...", size) > max_w:
+        while s and pr.measure_text_ex(self._font(size), s + "...", size, 0).x > max_w:
             s = s[:-1]
         return s + "..."
+
+    def _font(self, size):
+        if size not in self.fonts:
+            self.fonts[size] = pr.load_font_ex("CascadiaCode.ttf", size, None, 0)
+        return self.fonts[size]
 
     def _draw_frames(self):
         for module, x, y, w, h in self.layout.frames:
@@ -1161,10 +1169,10 @@ class Viewer:
             pr.draw_rectangle_lines_ex(rec, 2.0, self._col(rgb, 150))
             # title tab
             title = module.name + (" (external)" if module.external else ".py")
-            tw = pr.measure_text(title, FRAME_FS) + 20
+            tw = pr.measure_text_ex(self._font(FRAME_FS), title, FRAME_FS, 0).x + 20
             tab = pr.Rectangle(x, y, float(tw), FRAME_HEADER)
             pr.draw_rectangle_rec(tab, self._col(rgb, 210))
-            pr.draw_text(title, int(x + 10), int(y + 6), FRAME_FS,
+            pr.draw_text_ex(self._font(FRAME_FS), title, (int(x + 10), int(y + 6)), FRAME_FS, 0,
                          self._col((255, 255, 255)))
 
     def _row_center_y(self, f, i):
@@ -1228,8 +1236,7 @@ class Viewer:
             if f.kind == "module":
                 label = "<module> " + f.module.name
             label = self._fit_text(label, f.w - 16, TITLE_FS)
-            pr.draw_text(label, int(f.x + 8), int(f.y + 7), TITLE_FS,
-                         self._col((255, 255, 255)))
+            pr.draw_text_ex(self._font(TITLE_FS), label, (int(f.x + 8), int(f.y + 7)), TITLE_FS, 0, self._col((255, 255, 255)))
 
             if self.node_mode == "code":
                 self._draw_code_body(f, rgb)
@@ -1240,8 +1247,7 @@ class Viewer:
     def _draw_list_body(self, f, rgb):
         n, overflow = displayed_rows(f)
         if not f.calls:
-            pr.draw_text("(no calls)", int(f.x + 10),
-                         int(f.y + HEADER_H + PAD_TOP + 2), ROW_FS,
+            pr.draw_text_ex(self._font(ROW_FS), "(no calls)", (int(f.x + 10), int(f.y + HEADER_H + PAD_TOP + 2)), ROW_FS, 0,
                          self._col((160, 165, 175)))
         for i in range(n):
             call = f.calls[i]
@@ -1259,18 +1265,18 @@ class Viewer:
                     pr.Rectangle(f.x + 2, ry, f.w - 4, ROW_H),
                     self._col(rgb, 40))
             txt = self._fit_text(txt, f.w - 20, ROW_FS)
-            pr.draw_text(txt, int(f.x + 10), int(ry + 3), ROW_FS, col)
+            pr.draw_text_ex(self._font(ROW_FS), txt, (int(f.x + 10), int(ry + 3)), ROW_FS, 0, col)
         if overflow > 0:
             ry = f.y + HEADER_H + PAD_TOP + n * ROW_H
-            pr.draw_text("+%d more..." % overflow, int(f.x + 10),
-                         int(ry + 3), ROW_FS, self._col((150, 155, 165)))
+            pr.draw_text_ex(self._font(ROW_FS), "+%d more..." % overflow, (int(f.x + 10),
+                         int(ry + 3)), ROW_FS, 0, self._col((150, 155, 165)))
 
     def _draw_code_body(self, f, rgb):
         rows = f.code_rows or []
         if not rows:
-            pr.draw_text("(no source)", int(f.x + 10),
-                         int(f.y + HEADER_H + CODE_PAD_TOP + 2), CODE_FS,
-                         self._col((160, 165, 175)))
+            pr.draw_text_ex(self._font(CODE_FS), "(no source)", (int(f.x + 10),
+                         int(f.y + HEADER_H + CODE_PAD_TOP + 2)), CODE_FS,
+                         self._0, col((160, 165, 175)))
             return
 
         gutter_w = self._gutter_w(f)
@@ -1290,8 +1296,8 @@ class Viewer:
 
             # line-number gutter (right-aligned)
             num = str(lineno)
-            pr.draw_text(num, int(num_right - self._text_w(num, CODE_FS)),
-                         int(ly), CODE_FS, self._col((175, 180, 190)))
+            pr.draw_text_ex(self._font(CODE_FS), num, (int(num_right - self._text_w(num, CODE_FS)),
+                         int(ly)), CODE_FS, 0, self._col((175, 180, 190)))
 
             # call highlights (drawn behind the code text)
             for call in calls_by_line.get(lineno, ()):  # only lines starting here
@@ -1299,13 +1305,13 @@ class Viewer:
 
             # code text, truncated to the node's inner width
             text = self._fit_text(disp, body_right - code_left, CODE_FS)
-            pr.draw_text(text, int(code_left), int(ly), CODE_FS,
+            pr.draw_text_ex(self._font(CODE_FS), text, (int(code_left), int(ly)), CODE_FS, 0,
                          self._col((45, 52, 66)))
 
         if f.code_overflow > 0:
             oy = body_top + len(rows) * CODE_LINE_H
-            pr.draw_text("+%d more lines..." % f.code_overflow,
-                         int(code_left), int(oy), CODE_FS,
+            pr.draw_text_ex(self._font(CODE_FS), "+%d more lines..." % f.code_overflow,
+                         (int(code_left), int(oy)), CODE_FS, 0,
                          self._col((150, 155, 165)))
 
     def _draw_call_token(self, f, call, raw, ly, code_left, body_right):
@@ -1362,12 +1368,14 @@ class Viewer:
         else:
             crumb = "Focus  -  %s.%s" % (self.root.module.name, self.root.qualname)
         crumb += "   [%s]" % self.node_mode
-        pr.draw_text(crumb, 12, 11, 18, self._col((255, 255, 255)))
+        hud_crumb_fs = 18
+        pr.draw_text_ex(self._font(hud_crumb_fs), crumb, (12, 11), hud_crumb_fs, 0, self._col((255, 255, 255)))
         hint = ("L-click: focus   R-click call: open callee   drag: pan   "
                 "wheel: zoom   C: mode (calls/code/compact)   "
                 "Backspace: back   Home: overview   F: fit   Esc: quit")
-        hw = pr.measure_text(hint, 12)
-        pr.draw_text(hint, self.WIN_W - hw - 12, 14, 12, self._col((170, 178, 190)))
+        hud_hint_fs = 12
+        hw = pr.measure_text_ex(self._font(hud_hint_fs), hint, hud_hint_fs, 0).x
+        pr.draw_text_ex(self._font(hud_hint_fs), hint, (self.WIN_W - hw - hud_hint_fs, 14), hud_hint_fs, 0, self._col((170, 178, 190)))
 
     # ---- main loop ------------------------------------------------------- #
     def run(self):
