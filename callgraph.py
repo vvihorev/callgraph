@@ -439,7 +439,6 @@ NODE_X0 = 40.0
 FRAME_PAD = 18.0
 FRAME_HEADER = 28.0
 LANE_GAP = 44.0
-MAX_ROWS = 16
 
 TITLE_FS = 16
 ROW_FS = 13
@@ -454,8 +453,6 @@ CODE_PAD_BOT = 10.0
 CODE_GUTTER_GAP = 10.0     # gap between line-number gutter and the code text
 CODE_TEXT_PAD = 16.0       # slack added to the right of the widest line
 CODE_NODE_MIN_W = 280.0
-CODE_NODE_MAX_W = 640.0
-MAX_CODE_LINES = 46        # cap a node's shown source lines (rest -> "+N more")
 
 MODULE_PALETTE = [
     (74, 144, 226),    # blue  - main module
@@ -468,27 +465,32 @@ MODULE_PALETTE = [
 ]
 
 
+def node_title(f):
+    """The header label for a node (full text, never cropped)."""
+    return f.qualname if f.kind != "module" else "<module> " + f.module.name
+
+
+def call_row_text(f, call):
+    """Text shown for one call row in calls view (full, never cropped)."""
+    if call.resolved:
+        if call.callee.module is not f.module:
+            return "-> " + call.callee.module.name + "." + call.callee.qualname
+        return "-> " + call.callee.qualname
+    return "  " + call.raw_name
+
+
 def displayed_rows(f):
-    """How many call rows are shown (capped) and whether there is overflow."""
-    n = min(len(f.calls), MAX_ROWS)
-    overflow = len(f.calls) - n
-    return n, overflow
+    """Every call is shown (no cap); overflow is always 0."""
+    return len(f.calls), 0
 
 
 def node_height(f):
-    n, overflow = displayed_rows(f)
-    extra = ROW_H if overflow > 0 else 0.0
-    body = n * ROW_H + extra
-    if len(f.calls) == 0:
-        body = ROW_H  # keep a minimum body so leaf nodes aren't paper-thin
+    n, _ = displayed_rows(f)
+    body = n * ROW_H if n > 0 else ROW_H   # min body so leaf nodes aren't paper-thin
     return HEADER_H + PAD_TOP + body + PAD_BOT
 
 
 # --- code-view helpers ---------------------------------------------------- #
-def _clampf(v, lo, hi):
-    return lo if v < lo else hi if v > hi else v
-
-
 # Active font for on-screen text. None => raylib's built-in default font.
 # To use a custom font, load it in Viewer.run() (see the marked hook there) and
 # assign it here. Measuring (_text_w) and drawing (_draw_text) both go through
@@ -532,12 +534,10 @@ def function_span(f):
     return (start, end)
 
 
-def code_lines_for(f, max_lines=MAX_CODE_LINES):
-    """Return (base_lineno, [(abs_lineno, raw_text), ...], overflow_count).
-
-    For a function, that's its def..end span; for the synthetic module node it
-    is the whole file (capped). base_lineno is the absolute line of the first
-    shown row, so a call's screen row is (call.lineno - base_lineno).
+def code_lines_for(f):
+    """Return (base_lineno, [(abs_lineno, raw_text), ...], 0) with every source
+    line of the function's def..end span (or the whole file for the module
+    node). No line cap -- the full source is always shown.
     """
     src = f.module.source_lines
     if src is None:
@@ -553,31 +553,32 @@ def code_lines_for(f, max_lines=MAX_CODE_LINES):
     for ln in range(start, end + 1):
         if 1 <= ln <= len(src):
             rows.append((ln, src[ln - 1]))
-    overflow = 0
-    if len(rows) > max_lines:
-        overflow = len(rows) - max_lines
-        rows = rows[:max_lines]
-    return (start, rows, overflow)
+    return (start, rows, 0)
 
 
 def layout_node(f, node_mode):
     """Compute (width, height) for a node in the active display mode, one of
     "calls" (call list), "code" (source lines), or "compact" (title only).
 
-    In code view this also stashes the resolved source rows on the function so
-    drawing/edge-anchoring/hit-testing all agree on the geometry.
+    Nodes are always sized to fit their full content -- the complete title, and
+    every call row or source line -- so nothing is ever cropped horizontally or
+    vertically. In code view this also stashes the source rows on the function
+    so drawing/edge-anchoring/hit-testing agree on the geometry.
     """
+    title_w = _text_w(node_title(f), TITLE_FS) + 16.0   # 8px padding each side
+
     if node_mode != "code":
         f.code_base = None
         f.code_rows = None
         f.code_overflow = 0
         f.code_nlines = 0
         if node_mode == "compact":
-            label = (f.qualname if f.kind != "module"
-                     else "<module> " + f.module.name)
-            w = _clampf(_text_w(label, TITLE_FS) + 24.0, 140.0, CODE_NODE_MAX_W)
-            return w, HEADER_H
-        return NODE_W, node_height(f)
+            return max(140.0, title_w), HEADER_H
+        # calls: width fits the widest call row and the title; height fits all rows
+        row_w = 0.0
+        for call in f.calls:
+            row_w = max(row_w, _text_w(call_row_text(f, call), ROW_FS) + 20.0)
+        return max(NODE_W, title_w, row_w), node_height(f)
 
     base, rows, overflow = code_lines_for(f)
     f.code_base = base
@@ -587,18 +588,14 @@ def layout_node(f, node_mode):
 
     max_line_w = 0.0
     for _, text in rows:
-        w = _text_w(text.expandtabs(4), CODE_FS)
-        if w > max_line_w:
-            max_line_w = w
+        max_line_w = max(max_line_w, _text_w(text.expandtabs(4), CODE_FS))
     last_no = rows[-1][0] if rows else base
     gutter_w = _text_w(str(last_no), CODE_FS)
 
     inner = CODE_PAD_X * 2 + gutter_w + CODE_GUTTER_GAP + max_line_w + CODE_TEXT_PAD
-    w = _clampf(inner, CODE_NODE_MIN_W, CODE_NODE_MAX_W)
+    w = max(CODE_NODE_MIN_W, inner, title_w)          # no upper clamp -> full lines
 
-    nshown = len(rows) + (1 if overflow else 0)
-    if nshown == 0:
-        nshown = 1
+    nshown = max(len(rows), 1)
     h = HEADER_H + CODE_PAD_TOP + nshown * CODE_LINE_H + CODE_PAD_BOT
     return w, h
 
@@ -1222,14 +1219,6 @@ class Viewer:
     def _col(rgb, a=255):
         return pr.Color(int(rgb[0]), int(rgb[1]), int(rgb[2]), int(a))
 
-    @staticmethod
-    def _fit_text(s, max_w, size):
-        if _text_w(s, size) <= max_w:
-            return s
-        while s and _text_w(s + "...", size) > max_w:
-            s = s[:-1]
-        return s + "..."
-
     def _draw_frames(self):
         for module, x, y, w, h in self.layout.frames:
             rgb = self._module_color(module)
@@ -1300,12 +1289,8 @@ class Viewer:
             # header
             hdr = pr.Rectangle(f.x, f.y, f.w, HEADER_H)
             pr.draw_rectangle_rec(hdr, self._col(rgb, 235 if f.kind != "module" else 255))
-            label = f.qualname
-            if f.kind == "module":
-                label = "<module> " + f.module.name
-            label = self._fit_text(label, f.w - 16, TITLE_FS)
-            _draw_text(label, int(f.x + 8), int(f.y + 7), TITLE_FS,
-                         self._col((255, 255, 255)))
+            _draw_text(node_title(f), int(f.x + 8), int(f.y + 7), TITLE_FS,
+                       self._col((255, 255, 255)))
 
             if self.node_mode == "code":
                 self._draw_code_body(f, rgb)
@@ -1314,7 +1299,7 @@ class Viewer:
             # compact: header/title only, no body
 
     def _draw_list_body(self, f, rgb):
-        n, overflow = displayed_rows(f)
+        n, _ = displayed_rows(f)
         if not f.calls:
             _draw_text("(no calls)", int(f.x + 10),
                          int(f.y + HEADER_H + PAD_TOP + 2), ROW_FS,
@@ -1322,24 +1307,14 @@ class Viewer:
         for i in range(n):
             call = f.calls[i]
             ry = f.y + HEADER_H + PAD_TOP + i * ROW_H
-            if call.resolved:
-                txt = "-> " + call.callee.qualname
-                if call.callee.module is not f.module:
-                    txt = "-> " + call.callee.module.name + "." + call.callee.qualname
-                col = self._col((40, 50, 65))
-            else:
-                txt = "  " + call.raw_name
-                col = self._col((165, 170, 180))
+            col = (self._col((40, 50, 65)) if call.resolved
+                   else self._col((165, 170, 180)))
             if self.hover_func is f and 0 <= self._hover_row < n and self._hover_row == i:
                 pr.draw_rectangle_rec(
                     pr.Rectangle(f.x + 2, ry, f.w - 4, ROW_H),
                     self._col(rgb, 40))
-            txt = self._fit_text(txt, f.w - 20, ROW_FS)
-            _draw_text(txt, int(f.x + 10), int(ry + 3), ROW_FS, col)
-        if overflow > 0:
-            ry = f.y + HEADER_H + PAD_TOP + n * ROW_H
-            _draw_text("+%d more..." % overflow, int(f.x + 10),
-                         int(ry + 3), ROW_FS, self._col((150, 155, 165)))
+            _draw_text(call_row_text(f, call), int(f.x + 10), int(ry + 3),
+                       ROW_FS, col)
 
     def _draw_code_body(self, f, rgb):
         rows = f.code_rows or []
@@ -1373,21 +1348,15 @@ class Viewer:
             for call in calls_by_line.get(lineno, ()):  # only lines starting here
                 self._draw_call_token(f, call, raw, ly, code_left, body_right)
 
-            # code text, truncated to the node's inner width
-            text = self._fit_text(disp, body_right - code_left, CODE_FS)
-            _draw_text(text, int(code_left), int(ly), CODE_FS,
-                         self._col((45, 52, 66)))
-
-        if f.code_overflow > 0:
-            oy = body_top + len(rows) * CODE_LINE_H
-            _draw_text("+%d more lines..." % f.code_overflow,
-                         int(code_left), int(oy), CODE_FS,
-                         self._col((150, 155, 165)))
+            # full code line (node is sized to fit it -- never truncated)
+            _draw_text(disp, int(code_left), int(ly), CODE_FS,
+                       self._col((45, 52, 66)))
 
     def _draw_call_token(self, f, call, raw, ly, code_left, body_right):
         """Highlight one call's callee expression on its line and register it as
         a clickable region. Tokens spanning multiple lines are clamped to the
-        first line; tokens past the node's right edge are skipped."""
+        first line. Nodes are sized to fit their full lines, so tokens are never
+        cropped or dropped."""
         c0 = max(0, min(call.col_offset, len(raw)))
         if call.end_lineno == call.lineno:
             c1 = max(c0, min(call.end_col_offset, len(raw)))
@@ -1399,9 +1368,7 @@ class Viewer:
         pre_w = self._text_w(raw[:c0].expandtabs(4), CODE_FS)
         tok_w = self._text_w(raw[c0:c1].expandtabs(4), CODE_FS)
         tx = code_left + pre_w
-        if tok_w <= 0 or tx >= body_right:
-            return
-        if tx + tok_w > body_right:          # partly clipped -> not clickable
+        if tok_w <= 0:
             return
 
         hovered = (self._hover_call is call)
