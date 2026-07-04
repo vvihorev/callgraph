@@ -57,7 +57,6 @@ import os
 import sys
 import math
 from collections import deque, defaultdict
-from typing import TYPE_CHECKING
 
 # # raylib is only needed for the GUI. Guard the import so the parser/layout can
 # # be exercised head-less (e.g. with --dump, or in tests).
@@ -413,6 +412,19 @@ class Project:
         eps.sort(key=lambda f: f.qualname)
         return eps
 
+    def callers_of(self, func):
+        """Every parsed function that makes a resolved call to `func`."""
+        res = []
+        for m in self.modules.values():
+            if m.external:
+                continue
+            for f in m.functions.values():
+                if f is func:
+                    continue
+                if any(c.callee is func for c in f.calls):
+                    res.append(f)
+        return res
+
 
 # --------------------------------------------------------------------------- #
 #  Layout: assign each visible function a column (BFS depth) and coordinates.
@@ -436,7 +448,7 @@ ROW_FS = 13
 FRAME_FS = 18
 
 # --- source-code view metrics --------------------------------------------- #
-CODE_FS = 15
+CODE_FS = 13
 CODE_LINE_H = 16.0
 CODE_PAD_X = 10.0
 CODE_PAD_TOP = 8.0
@@ -674,13 +686,24 @@ class Layout:
         self.frames = []           # list[(Module, x, y, w, h)]
         self.node_mode = "calls"   # "calls" | "code" | "compact"
 
-    def build(self, sources, include_all_main=False, node_mode="calls"):
-        self.node_mode = node_mode
-        # reset transient state
+    def _reset(self):
         for m in self.project.modules.values():
             for f in m.functions.values():
                 f.col = None
                 f.visible = False
+
+    def _commit(self, col, node_mode):
+        self.visible = []
+        for f, c in col.items():
+            f.col = c
+            f.visible = True
+            f.w, f.h = layout_node(f, node_mode)
+            self.visible.append(f)
+        self._place_modules()
+
+    def build(self, sources, include_all_main=False, node_mode="calls"):
+        self.node_mode = node_mode
+        self._reset()
 
         col = assign_columns(sources)
 
@@ -694,15 +717,24 @@ class Layout:
             if extra:
                 col = assign_columns(list(sources) + extra)
 
-        # commit column assignment + node sizes (mode-dependent)
-        self.visible = []
-        for f, c in col.items():
-            f.col = c
-            f.visible = True
-            f.w, f.h = layout_node(f, node_mode)
-            self.visible.append(f)
+        self._commit(col, node_mode)
 
-        self._place_modules()
+    def build_focus(self, root, node_mode="calls"):
+        """Focus view centered on `root`: the root's direct callers fill the
+        first column, the root sits in the second column, and the root's callees
+        fan out to the right. (When the root has no known callers it simply
+        stays in the first column so there is no empty gap.)"""
+        self.node_mode = node_mode
+        self._reset()
+
+        col = assign_columns([root])                 # root=0, callees=1,2,...
+        callers = [g for g in self.project.callers_of(root) if g not in col]
+        if callers:
+            col = {f: c + 1 for f, c in col.items()}  # shift: root->1, callees->2+
+            for g in callers:
+                col[g] = 0                            # callers occupy column 0
+
+        self._commit(col, node_mode)
 
     # -- module placement (2D: depth = column, siblings stack in rows) ------ #
     def _module_super_columns(self, by_module):
@@ -883,8 +915,8 @@ class Viewer:
         self.mode = "module"       # "module" or "function"
         self.node_mode = "calls"   # "calls" | "code" | "compact"
         self.root = None           # focused Function in function mode
-        self.highlight = None      # callee highlighted after a click
-        self.history = []          # stack of (mode, root, highlight)
+        self.selected = None       # single-clicked node (edges highlighted)
+        self.history = []          # stack of (mode, root) focus states only
 
         # code-view interaction
         self.mouse_world = (0.0, 0.0)
@@ -920,23 +952,23 @@ class Viewer:
 
     # ---- view switching -------------------------------------------------- #
     def show_overview(self, record=True):
-        if record:
-            self.history.append((self.mode, self.root, self.highlight))
+        if record and self.mode == "function":
+            self.history.append((self.mode, self.root))
         self.mode = "module"
         self.root = None
-        self.highlight = None
+        self.selected = None
         sources = [self.project.main.module_node] + self.project.entrypoints()
         self.layout.build(sources, include_all_main=True, node_mode=self.node_mode)
         self.fit_all()
 
     def _rebuild_current(self):
         """Re-run the layout for whatever graph is showing (e.g. after a
-        display-mode change), preserving root/highlight."""
+        display-mode change), preserving root/selection."""
         if self.mode == "module":
             sources = [self.project.main.module_node] + self.project.entrypoints()
             self.layout.build(sources, include_all_main=True, node_mode=self.node_mode)
         else:
-            self.layout.build([self.root], node_mode=self.node_mode)
+            self.layout.build_focus(self.root, node_mode=self.node_mode)
 
     def cycle_node_mode(self):
         order = ("calls", "code", "compact")
@@ -944,15 +976,22 @@ class Viewer:
         self._rebuild_current()
         self.fit_all()
 
-    def focus(self, func, highlight=None, record=True):
-        if func is None or func.external:
+    def select(self, func):
+        """First click: mark a node so its call edges stay highlighted."""
+        self.selected = func
+
+    def focus(self, func, record=True):
+        """Zoom in on a node: it moves to the second column with its callers in
+        the first column and callees to the right. Only focus navigation is
+        recorded in history, so Backspace steps between focused nodes."""
+        if func is None or func.external or func.kind == "module":
             return
         if record:
-            self.history.append((self.mode, self.root, self.highlight))
+            self.history.append((self.mode, self.root))
         self.mode = "function"
         self.root = func
-        self.highlight = highlight
-        self.layout.build([func], node_mode=self.node_mode)
+        self.selected = func
+        self.layout.build_focus(func, node_mode=self.node_mode)
         # place the focused node near the top-left of the screen
         self.goal_target = (func.x - 12.0, func.y - 12.0)
         self.goal_zoom = 1.0
@@ -961,11 +1000,11 @@ class Viewer:
     def go_back(self):
         if not self.history:
             return
-        mode, root, highlight = self.history.pop()
-        if mode == "module":
+        mode, root = self.history.pop()
+        if mode == "module" or root is None:
             self.show_overview(record=False)
         else:
-            self.focus(root, highlight, record=False)
+            self.focus(root, record=False)
 
     # ---- camera ---------------------------------------------------------- #
     def fit_all(self):
@@ -1098,36 +1137,26 @@ class Viewer:
         self.hover_func = self._func_at(world.x, world.y)
 
     def _on_click(self, mx, my):
+        """Two-stage left click: the first click on a node selects it (its call
+        edges stay highlighted); a second click on the same node focuses it
+        (zoom in). Clicking empty space clears the selection."""
         world = pr.get_screen_to_world_2d(pr.Vector2(mx, my), self.cam)
-
-        # code view: a click on a highlighted call token re-roots on the
-        # function that call is made FROM, highlighting the callee (same
-        # semantics as clicking a call row in list view).
-        if self.node_mode == "code":
-            for (hx, hy, hw, hh, caller, call) in self.code_hits:
-                if hx <= world.x <= hx + hw and hy <= world.y <= hy + hh:
-                    self.focus(caller, highlight=call.callee)
-                    return
-
         f = self._func_at(world.x, world.y)
-        if f is None or f.kind == "module":
+        if f is None:
+            self.selected = None
             return
-        if self.node_mode != "calls":
-            # code view (node but not a token) or compact -> just focus the node
-            self.focus(f)
+        if f.kind == "module":
+            self.select(f)                 # highlight only; module node isn't focusable
             return
-        # list view: if a specific call row was hit, remember its callee
-        highlight = None
-        idx = self._row_index_at(f, world.y)
-        if idx is not None and idx < len(f.calls):
-            highlight = f.calls[idx].callee
-        # clicking a call focuses the function the call is made FROM
-        self.focus(f, highlight=highlight)
+        if f is self.selected and f is not self.root:
+            self.focus(f)                  # second click -> zoom in
+        else:
+            self.select(f)                 # first click -> highlight its call edges
 
     def _on_right_click(self, mx, my):
-        """Right-clicking a call focuses the CALLEE node -- the same result as
-        clicking the called node itself. (Left-click on a call instead re-roots
-        on the caller.) Right-clicking anything that isn't a call does nothing."""
+        """Right-clicking a call jumps straight to the CALLEE node -- the same
+        as clicking the called node itself. (Left-click selects/focuses the
+        node the call is made FROM.) Right-clicking anything else does nothing."""
         world = pr.get_screen_to_world_2d(pr.Vector2(mx, my), self.cam)
         if self.node_mode == "code":
             for (hx, hy, hw, hh, caller, call) in self.code_hits:
@@ -1198,9 +1227,8 @@ class Viewer:
                     continue
                 start = pr.Vector2(f.x + f.w, self._edge_anchor_y(f, call, i))
                 end = pr.Vector2(g.x, g.y + HEADER_H / 2)
-                if (self.mode == "function" and f is self.root
-                        and g is self.highlight):
-                    color = self._col((235, 150, 40), 255)
+                if self.selected is f or self.selected is g:
+                    color = self._col((235, 150, 40), 255)   # selected node's edges
                     thick = 3.0
                 elif self.hover_func is f or self.hover_func is g:
                     color = self._col((90, 130, 200), 230)
@@ -1218,10 +1246,10 @@ class Viewer:
             pr.draw_rectangle_rec(rec, self._col((252, 252, 253)))
 
             is_root = (self.mode == "function" and f is self.root)
-            is_hi = (f is self.highlight)
+            is_sel = (f is self.selected)
             if is_root:
                 border, bt = self._col((40, 90, 200)), 3.0
-            elif is_hi:
+            elif is_sel:
                 border, bt = self._col((235, 150, 40)), 3.0
             elif self.hover_func is f:
                 border, bt = self._col(rgb, 255), 2.5
@@ -1335,7 +1363,7 @@ class Viewer:
             return
 
         hovered = (self._hover_call is call)
-        is_focus_hi = (f is self.root and call.callee is self.highlight)
+        is_focus_hi = (f is self.selected)      # tokens of the selected node
         if call.resolved:
             if is_focus_hi:
                 fill = self._col((235, 150, 40), 150 if hovered else 90)
