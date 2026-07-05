@@ -929,6 +929,7 @@ class Viewer:
         self.selected = None       # single-clicked node (edges highlighted)
         self.armed = None          # last single-clicked focus target (Call or Function)
         self.history = []          # stack of (mode, root) focus states only
+        self.reverse_history = []  # stack of (mode, root) focus states populated when going back in history
 
         # code-view interaction
         self.mouse_world = (0.0, 0.0)
@@ -1036,6 +1037,7 @@ class Viewer:
     def show_overview(self, record=True):
         if record and self.mode == "function":
             self.history.append((self.mode, self.root))
+            self.reverse_history = []
         self.mode = "module"
         self.root = None
         self.selected = None
@@ -1082,6 +1084,7 @@ class Viewer:
             return
         if record:
             self.history.append((self.mode, self.root))
+            self.reverse_history = []
         self.mode = "function"
         self.root = func
         self.selected = func
@@ -1099,6 +1102,17 @@ class Viewer:
         if not self.history:
             return
         mode, root = self.history.pop()
+        self.reverse_history.append((self.mode, self.root))
+        if mode == "module" or root is None:
+            self.show_overview(record=False)
+        else:
+            self.focus(root, record=False)
+
+    def go_forward(self):
+        if not self.reverse_history:
+            return
+        mode, root = self.reverse_history.pop()
+        self.history.append((self.mode, self.root))
         if mode == "module" or root is None:
             self.show_overview(record=False)
         else:
@@ -1233,8 +1247,11 @@ class Viewer:
         # keyboard
         if pr.is_key_pressed(pr.KeyboardKey.KEY_HOME):
             self.show_overview()
-        if pr.is_key_pressed(pr.KeyboardKey.KEY_BACKSPACE):
+        if (pr.is_key_pressed(pr.KeyboardKey.KEY_BACKSPACE)
+            or pr.is_key_down(pr.KeyboardKey.KEY_LEFT_CONTROL) and pr.is_key_pressed(pr.KeyboardKey.KEY_O)):
             self.go_back()
+        if pr.is_key_down(pr.KeyboardKey.KEY_LEFT_CONTROL) and pr.is_key_pressed(pr.KeyboardKey.KEY_I):
+            self.go_forward()
         if pr.is_key_pressed(pr.KeyboardKey.KEY_F):
             self.fit_all()
         if pr.is_key_pressed(pr.KeyboardKey.KEY_Z):
@@ -1512,6 +1529,9 @@ class Viewer:
                 "Backspace: back   Home: overview   F: fit   Esc: quit")
         hw = _text_w(hint, 12)
         _draw_text(hint, self.WIN_W - hw - 12, 14, 12, self._col((170, 178, 190)))
+
+        _draw_text(str(self.history), self.WIN_W - hw - 12, 54, 12, self._col((170, 178, 190)))
+        _draw_text(str(self.reverse_history), self.WIN_W - hw - 12, 74, 12, self._col((170, 178, 190)))
 
     def _draw_search(self):
         if not self.search_active:
