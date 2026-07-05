@@ -58,12 +58,8 @@ import sys
 import math
 from collections import deque, defaultdict
 
-# raylib is only needed for the GUI. Guard the import so the parser/layout can
-# be exercised head-less (e.g. with --dump, or in tests).
-try:
-    import pyray as pr
-except Exception:  # pragma: no cover - depends on local install
-    pr = None
+import pyray as pr
+from raylib.enums import KeyboardKey
 
 
 # --------------------------------------------------------------------------- #
@@ -96,6 +92,7 @@ class Function:
         self.external = external      # True when we have no source for it
         self.kind = kind              # "function" | "module" | "class"
         self.calls = []               # list[Call], filled during resolution
+        self.mode_override = None      # per-node display mode ("calls"/"code"/"compact") or None
 
         # transient layout fields (reset every time we re-layout)
         self.col = None
@@ -502,8 +499,6 @@ _SPACING = 1.0
 
 def _text_w(s, size):
     """Pixel width of a string in the active font (estimate when head-less)."""
-    if pr is None:
-        return float(len(s)) * size * 0.55
     if _FONT is None:
         return float(pr.measure_text(s, size))
     return float(pr.measure_text_ex(_FONT, s, float(size), _SPACING).x)
@@ -713,7 +708,7 @@ class Layout:
         for f, c in col.items():
             f.col = c
             f.visible = True
-            f.w, f.h = layout_node(f, node_mode)
+            f.w, f.h = layout_node(f, f.mode_override or node_mode)
             self.visible.append(f)
         self._place_modules()
 
@@ -1007,24 +1002,24 @@ class Viewer:
                 self.search_query += chr(c)
                 changed = True
             c = pr.get_char_pressed()
-        if pr.is_key_pressed(pr.KEY_BACKSPACE) and self.search_query:
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_BACKSPACE) and self.search_query:
             self.search_query = self.search_query[:-1]
             changed = True
         if changed:
             self._recompute_search()
 
         n = len(self.search_results)
-        if pr.is_key_pressed(pr.KEY_DOWN) and n:
+        if (pr.is_key_pressed(pr.KeyboardKey.KEY_DOWN)
+            or pr.is_key_down(pr.KeyboardKey.KEY_LEFT_CONTROL) and pr.is_key_pressed(pr.KeyboardKey.KEY_N)) and n:
             self.search_index = (self.search_index + 1) % n
-        if pr.is_key_pressed(pr.KEY_UP) and n:
+        if (pr.is_key_pressed(pr.KeyboardKey.KEY_UP)
+            or pr.is_key_down(pr.KeyboardKey.KEY_LEFT_CONTROL) and pr.is_key_pressed(pr.KeyboardKey.KEY_P)) and n:
             self.search_index = (self.search_index - 1) % n
-        if pr.is_key_pressed(pr.KeyboardKey.KEY_LEFT_CONTROL) and pr.is_key_pressed(pr.KeyboardKey.KEY_N) and n:
-            self.search_index = (self.search_index - 1) % n
-        if pr.is_key_pressed(pr.KEY_ENTER) or pr.is_key_pressed(pr.KEY_KP_ENTER):
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_ENTER) or pr.is_key_pressed(pr.KeyboardKey.KEY_KP_ENTER):
             if self.search_results:
                 self.focus(self.search_results[self.search_index])
             self._close_search()
-        if pr.is_key_pressed(pr.KEY_ESCAPE):
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_ESCAPE):
             self._close_search()
 
     # ---- colour bookkeeping --------------------------------------------- #
@@ -1058,12 +1053,26 @@ class Viewer:
         else:
             self.layout.build_focus(self.root, node_mode=self.node_mode)
 
+    def _mode_of(self, f):
+        """Effective display mode for a node: its per-node override if set,
+        otherwise the global mode."""
+        return f.mode_override or self.node_mode
+
     def cycle_node_mode(self):
-        order = ("calls", "code", "compact")
-        self.node_mode = order[(order.index(self.node_mode) + 1) % len(order)]
-        self.armed = None          # token/row hit-boxes change between modes
-        self._rebuild_current()
-        self.fit_all()
+        order = ("calls", "compact", "code")
+        if self.selected is not None:
+            # cycle only the selected node's mode (title / calls / code)
+            cur = self._mode_of(self.selected)
+            self.selected.mode_override = order[(order.index(cur) + 1) % len(order)]
+            self.armed = None
+            self._rebuild_current()        # re-layout so the node resizes in place
+        else:
+            for func in self.layout.visible:
+                func.mode_override = None
+            self.node_mode = order[(order.index(self.node_mode) + 1) % len(order)]
+            self.armed = None
+            self._rebuild_current()
+            self.fit_all()
 
     def focus(self, func, record=True):
         """Zoom in on a node: it moves to the second column with its callers in
@@ -1102,6 +1111,13 @@ class Viewer:
         avail_h = self.WIN_H - self.OFFSET_Y - 40
         zoom = min(avail_w / max(w, 1.0), avail_h / max(h, 1.0))
         zoom = _clamp(zoom, 0.15, 1.2)
+        self.goal_target = (x - 12.0, y - 12.0)
+        self.goal_zoom = zoom
+        self.animating = True
+
+    def zoom_root(self):
+        x, y, _, _ = self.layout.bounds()
+        zoom = 1.2
         self.goal_target = (x - 12.0, y - 12.0)
         self.goal_zoom = zoom
         self.animating = True
@@ -1177,10 +1193,10 @@ class Viewer:
 
         # right button: right-drag pans; a right-click without dragging focuses
         # the callee under the cursor (as if the called node itself was clicked)
-        if pr.is_mouse_button_pressed(pr.MOUSE_BUTTON_RIGHT):
+        if pr.is_mouse_button_pressed(pr.MouseButton.MOUSE_BUTTON_RIGHT):
             self.rpress_pos = (mx, my)
             self.rdragging = False
-        if pr.is_mouse_button_down(pr.MOUSE_BUTTON_RIGHT):
+        if pr.is_mouse_button_down(pr.MouseButton.MOUSE_BUTTON_RIGHT):
             rmoved = abs(mx - self.rpress_pos[0]) + abs(my - self.rpress_pos[1])
             if rmoved > 6:
                 self.rdragging = True
@@ -1190,16 +1206,16 @@ class Viewer:
                     self.cam.target.y - dy / self.cam.zoom,
                 )
                 self.animating = False
-        if pr.is_mouse_button_released(pr.MOUSE_BUTTON_RIGHT):
+        if pr.is_mouse_button_released(pr.MouseButton.MOUSE_BUTTON_RIGHT):
             if not self.rdragging:
                 self._on_right_click(mx, my)
             self.rdragging = False
 
         # left button: distinguish click from drag-pan
-        if pr.is_mouse_button_pressed(pr.MOUSE_BUTTON_LEFT):
+        if pr.is_mouse_button_pressed(pr.MouseButton.MOUSE_BUTTON_LEFT):
             self.press_pos = (mx, my)
             self.dragging = False
-        if pr.is_mouse_button_down(pr.MOUSE_BUTTON_LEFT):
+        if pr.is_mouse_button_down(pr.MouseButton.MOUSE_BUTTON_LEFT):
             moved = abs(mx - self.press_pos[0]) + abs(my - self.press_pos[1])
             if moved > 6:
                 self.dragging = True
@@ -1209,23 +1225,25 @@ class Viewer:
                     self.cam.target.y - dy / self.cam.zoom,
                 )
                 self.animating = False
-        if pr.is_mouse_button_released(pr.MOUSE_BUTTON_LEFT):
+        if pr.is_mouse_button_released(pr.MouseButton.MOUSE_BUTTON_LEFT):
             if not self.dragging:
                 self._on_click(mx, my)
             self.dragging = False
 
         # keyboard
-        if pr.is_key_pressed(pr.KEY_HOME):
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_HOME):
             self.show_overview()
-        if pr.is_key_pressed(pr.KEY_BACKSPACE):
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_BACKSPACE):
             self.go_back()
-        if pr.is_key_pressed(pr.KEY_F):
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_F):
             self.fit_all()
-        if pr.is_key_pressed(pr.KEY_C):
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_Z):
+            self.zoom_root()
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_C):
             self.cycle_node_mode()
-        if pr.is_key_pressed(pr.KEY_SLASH):
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_SLASH):
             self._open_search()
-        if pr.is_key_pressed(pr.KEY_ESCAPE):
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_ESCAPE):
             self.quit = True
 
         # hover
@@ -1235,19 +1253,17 @@ class Viewer:
 
     def _call_at(self, wx, wy):
         """Return (call, caller_func) for the call under the cursor, or None.
-        Uses the code-view token hit-boxes in code mode and the call rows in
-        calls mode; compact mode shows no calls."""
-        if self.node_mode == "code":
-            for (hx, hy, hw, hh, caller, call) in self.code_hits:
-                if hx <= wx <= hx + hw and hy <= wy <= hy + hh:
-                    return call, caller
-            return None
-        if self.node_mode == "calls":
-            f = self._func_at(wx, wy)
-            if f is not None:
-                idx = self._row_index_at(f, wy)
-                if idx is not None and idx < len(f.calls):
-                    return f.calls[idx], f
+        Works with mixed per-node modes: code-mode nodes register token hit-boxes
+        (checked first), and a calls-mode node under the cursor is row hit-tested.
+        Compact nodes expose no calls."""
+        for (hx, hy, hw, hh, caller, call) in self.code_hits:
+            if hx <= wx <= hx + hw and hy <= wy <= hy + hh:
+                return call, caller
+        f = self._func_at(wx, wy)
+        if f is not None and self._mode_of(f) == "calls":
+            idx = self._row_index_at(f, wy)
+            if idx is not None and idx < len(f.calls):
+                return f.calls[idx], f
         return None
 
     def _on_click(self, mx, my):
@@ -1318,12 +1334,13 @@ class Viewer:
         return f.y + HEADER_H + PAD_TOP + i * ROW_H + ROW_H / 2
 
     def _edge_anchor_y(self, f, call, i):
-        if self.node_mode == "code":
+        mode = self._mode_of(f)
+        if mode == "code":
             y = self._code_line_center_y(f, call.lineno)
             if y is not None:
                 return y
             return f.y + f.h / 2          # call not on a shown line
-        if self.node_mode == "compact":
+        if mode == "compact":
             return f.y + f.h / 2          # title-only node: anchor at its middle
         return self._row_center_y(f, i)
 
@@ -1371,9 +1388,10 @@ class Viewer:
             _draw_text(node_title(f), int(f.x + 8), int(f.y + 7), TITLE_FS,
                        self._col((255, 255, 255)))
 
-            if self.node_mode == "code":
+            mode = self._mode_of(f)
+            if mode == "code":
                 self._draw_code_body(f, rgb)
-            elif self.node_mode == "calls":
+            elif mode == "calls":
                 self._draw_list_body(f, rgb)
             # compact: header/title only, no body
 
@@ -1484,10 +1502,13 @@ class Viewer:
         else:
             crumb = "Focus  -  %s.%s" % (self.root.module.name, self.root.qualname)
         crumb += "   [%s]" % self.node_mode
+        if self.selected is not None and self.selected.mode_override is not None:
+            crumb += "   (%s: %s)" % (self.selected.qualname,
+                                      self.selected.mode_override)
         _draw_text(crumb, 12, 11, 18, self._col((255, 255, 255)))
         hint = ("click: select   dbl-click: open (call->callee, node->zoom)   "
                 "R-click call: callee   drag: pan   wheel: zoom   "
-                "C: mode   /: search   "
+                "C: mode (selected node, else all)   /: search   "
                 "Backspace: back   Home: overview   F: fit   Esc: quit")
         hw = _text_w(hint, 12)
         _draw_text(hint, self.WIN_W - hw - 12, 14, 12, self._col((170, 178, 190)))
@@ -1530,7 +1551,7 @@ class Viewer:
 
     # ---- main loop ------------------------------------------------------- #
     def run(self):
-        pr.set_config_flags(pr.FLAG_WINDOW_RESIZABLE | pr.FLAG_MSAA_4X_HINT)
+        pr.set_config_flags(pr.ConfigFlags.FLAG_WINDOW_RESIZABLE | pr.ConfigFlags.FLAG_MSAA_4X_HINT)
         pr.init_window(self.WIN_W, self.WIN_H, "callgraph - %s" % self.project.main.name)
         pr.set_target_fps(60)
 
@@ -1546,13 +1567,13 @@ class Viewer:
         #     _SPACING = 0.5
         # (A monospaced font is recommended for the code view.)
         global _FONT, _SPACING
-        _FONT = pr.load_font_ex("CascadiaCode.ttf", 32, None, 0)
-        pr.set_texture_filter(_FONT.texture, pr.TEXTURE_FILTER_BILINEAR)
+        _FONT = pr.load_font_ex("Iosevka-Light.ttf", 32, None, 0)
+        pr.set_texture_filter(_FONT.texture, pr.TextureFilter.TEXTURE_FILTER_BILINEAR)
         _SPACING = 0.5
 
         self.cam = pr.Camera2D(pr.Vector2(self.OFFSET_X, self.OFFSET_Y),
                                pr.Vector2(0, 0), 0.0, 1.0)
-        pr.set_exit_key(pr.KEY_NULL)      # ESC is handled manually (closes search / quits)
+        pr.set_exit_key(pr.KeyboardKey.KEY_NULL)      # ESC is handled manually (closes search / quits)
         self.prev_mouse = (pr.get_mouse_position().x, pr.get_mouse_position().y)
         self.show_overview(record=False)
 
@@ -1562,18 +1583,17 @@ class Viewer:
             self._handle_input()
             self._ease_camera()
 
-            # precompute hover state used while drawing
+            # precompute hover state used while drawing (mixed per-node modes)
             self._hover_row = -1
             self._hover_call = None
-            if self.node_mode == "code":
-                wx, wy = self.mouse_world
-                for (hx, hy, hw, hh, caller, call) in self.code_hits:
-                    if hx <= wx <= hx + hw and hy <= wy <= hy + hh:
-                        self._hover_call = call
-                        break
-            elif self.node_mode == "calls" and self.hover_func is not None:
-                world = pr.get_screen_to_world_2d(pr.get_mouse_position(), self.cam)
-                ri = self._row_index_at(self.hover_func, world.y)
+            wx, wy = self.mouse_world
+            for (hx, hy, hw, hh, caller, call) in self.code_hits:   # code-mode nodes
+                if hx <= wx <= hx + hw and hy <= wy <= hy + hh:
+                    self._hover_call = call
+                    break
+            if (self.hover_func is not None
+                    and self._mode_of(self.hover_func) == "calls"):
+                ri = self._row_index_at(self.hover_func, wy)
                 self._hover_row = ri if ri is not None else -1
 
             pr.begin_drawing()
@@ -1614,15 +1634,6 @@ def main(argv):
     if "--dump" in flags:
         dump(project)
         return 0
-
-    if pr is None:
-        sys.stderr.write(
-            "raylib is not installed. Install it with:\n"
-            "    pip install raylib\n"
-            "Then run:\n"
-            "    python callgraph.py %s\n"
-            "(You can inspect the parse result without a GUI via --dump.)\n" % path)
-        return 1
 
     Viewer(project).run()
     return 0
