@@ -1582,7 +1582,7 @@ class Viewer:
 
     # ---- main loop ------------------------------------------------------- #
     def run(self):
-        pr.set_config_flags(pr.ConfigFlags.FLAG_WINDOW_RESIZABLE | pr.ConfigFlags.FLAG_MSAA_4X_HINT)
+        pr.set_config_flags(pr.ConfigFlags.FLAG_WINDOW_RESIZABLE | pr.ConfigFlags.FLAG_MSAA_4X_HINT | pr.ConfigFlags.FLAG_WINDOW_HIGHDPI)
         pr.init_window(self.WIN_W, self.WIN_H, "callgraph - %s" % self.project.main.name)
         pr.set_target_fps(60)
 
@@ -1598,7 +1598,7 @@ class Viewer:
         #     _SPACING = 0.5
         # (A monospaced font is recommended for the code view.)
         global _FONT, _SPACING
-        _FONT = pr.load_font_ex((Path(__file__) / "Iosevka-Light.ttf").as_posix(), 32, None, 0)
+        _FONT = pr.load_font_ex((Path(__file__).parent / "Iosevka-Light.ttf").as_posix(), 32, None, 0)
         pr.set_texture_filter(_FONT.texture, pr.TextureFilter.TEXTURE_FILTER_BILINEAR)
         _SPACING = 0.5
 
