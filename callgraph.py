@@ -56,6 +56,7 @@ import ast
 import os
 import sys
 from collections import deque, defaultdict
+from pathlib import Path
 
 import pyray as pr
 from raylib.enums import KeyboardKey as kk
@@ -1597,7 +1598,7 @@ class Viewer:
         #     _SPACING = 0.5
         # (A monospaced font is recommended for the code view.)
         global _FONT, _SPACING
-        _FONT = pr.load_font_ex("Iosevka-Light.ttf", 32, None, 0)
+        _FONT = pr.load_font_ex((Path(__file__) / "Iosevka-Light.ttf").as_posix(), 32, None, 0)
         pr.set_texture_filter(_FONT.texture, pr.TextureFilter.TEXTURE_FILTER_BILINEAR)
         _SPACING = 0.5
 
