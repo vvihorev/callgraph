@@ -1087,6 +1087,7 @@ class Viewer:
         self.mode = "function"
         self.root = func
         self.selected = func
+        func.mode_override = "code"
         self.armed = None
         self.layout.build_focus(func, node_mode=self.node_mode)
         # Frame the top-left-most node -- the first caller in column 0 -- so the
@@ -1262,7 +1263,25 @@ class Viewer:
         if pr.is_key_pressed(kk.KEY_SLASH):
             self._open_search()
         if pr.is_key_pressed(kk.KEY_ESCAPE):
-            self.quit = True
+            if self.selected is not None:
+                self.selected = None
+            else:
+                self.quit = True
+
+        if pr.is_key_down(kk.KEY_LEFT_SHIFT) and pr.is_key_down(kk.KEY_J):
+            self.goal_zoom *= 0.95
+            self.animating = True
+        if pr.is_key_down(kk.KEY_LEFT_SHIFT) and pr.is_key_down(kk.KEY_K):
+            self.goal_zoom *= 1.05
+            self.animating = True
+        if pr.is_key_down(kk.KEY_J):
+            self.cam.target.y += 10 / self.goal_zoom
+        if pr.is_key_down(kk.KEY_K):
+            self.cam.target.y -= 10 / self.goal_zoom
+        if pr.is_key_down(kk.KEY_H):
+            self.cam.target.x -= 20 / self.goal_zoom
+        if pr.is_key_down(kk.KEY_L):
+            self.cam.target.x += 20 / self.goal_zoom
 
         # hover
         world = pr.get_screen_to_world_2d(pr.Vector2(mx, my), self.cam)
